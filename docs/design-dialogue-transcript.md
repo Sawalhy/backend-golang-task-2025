@@ -867,6 +867,99 @@ deadlock avoidance) because both follow from the analysis rather than from a pre
 
 ---
 
+## Exchange 16 — Invariants, derived socratically *(2026-08-07)*
+
+Format changed here at Ahmed's request: he asks, I answer only what was asked, and each beat ends
+with a question back rather than a wall of prose. Full content in `DESIGN_NOTES.md` §5.11.
+
+**Ahmed:** *"I dont understand why the transaction wouldnt work honestly."* — the pivotal question of
+the session. Answer: a plain `SELECT` takes no row lock, MVCC or not, `BEGIN` or not. Transactions
+give atomicity and isolation from uncommitted data, never mutual exclusion. In the naive oversell
+Postgres blocks, wakes, and computes `0 - 1` flawlessly — it was told "subtract one" and was never
+shown the condition, which lived in a JS `if`.
+
+**Ahmed:** *"Isnt the mechanism behind fix 2 and 3 the same?"* — **Yes, and he was right to push.**
+Same statement, same block-then-re-evaluate, same rowcount. The difference is only what sits in the
+predicate: `available >= 1` is the business invariant itself (rowcount 0 = terminal, 409);
+`version = 5` is a proxy for "did anything change" (rowcount 0 = retry). Hence the spurious-failure
+gap — 49 units in stock and a versioned writer still retries.
+
+**Ahmed:** *"Update is blocking?"* — Yes; writes take row locks even though reads don't. Clarified
+what blocks: not the event loop, the **pooled connection**. Which is the actual reason behind the
+never-hold-a-lock-across-network-I/O rule — a 2400ms lock is a 2400ms burned connection out of ~16.
+
+**The exercise.** Given a credit-limit invariant (`Σ pending ≤ 500`) and asked to write it as a
+Fix-2 conditional `UPDATE`. Ahmed reached for `HAVING`, correctly identifying it as an aggregate.
+Shown that the statement is syntactically fine and semantically broken: two concurrent inserts never
+touch a common row, so nothing blocks — a phantom, not a race on a row.
+
+**Ahmed solved it unprompted:** *"have the source of truth be in one row, ex. a total row that we can
+use CAS on, and we only do the insert if the CAS goes through."* Exactly the set→row collapse.
+
+**Ahmed:** *"what are the available invariants, what exactly is an invariant actually"* — prompted the
+definition, the four-kind taxonomy, the unique-index-has-an-address insight, and the full catalogue.
+
+**Ahmed then named the catastrophe himself:** R2, gapless invoice numbers — *"every order in the
+system serializes on one row."* Closed with the arithmetic, the lock-releases-at-`COMMIT` refinement,
+and the general rule: shrink the contention domain rather than speed up the lock.
+
+**Correction carried forward:** my credit-limit example used $460 pending against two $50 orders,
+which fails individually and demonstrates nothing. Should have been $420.
+
+**Still owed from §5.10:** F and G were handed over as finished solutions rather than derived. Ahmed
+called this out. To be redone as questions.
+
+---
+
+## Exchange 17 — The dual write, derived *(2026-08-07)*
+
+Full content in `DESIGN_NOTES.md` §5.12. The route Ahmed's answers actually took:
+
+**Asked** which invariant kind *"every PENDING order has one live job"* is, and what breaks when the
+order lives in Postgres and the job in RabbitMQ. **Ahmed:** *"You cant make it into an atomic
+transaction because different parts are happening in different systems"* — correct. Then: *"the
+ability to defend the invariant is not diminished its just gotten more complicated, we need our
+transactions to be idempotent because of the fact that the work can be done twice."*
+
+**Half right, and the productive half.** Idempotency owns *at most one effect* completely and is
+inert against *at least one*. Crash between `COMMIT` and `publish` and there is no message, no
+consumer, nothing to deduplicate. Also conceded: the invariant as I posed it isn't achievable —
+that's exactly-once delivery. Ahmed had independently supplied the second clause of the achievable
+version.
+
+**Ahmed:** *"What is AMQP and XA?"* and *"I am not sure what the two writes are"* — both fair; I had
+dropped jargon and been vague. Defined, then gave the six forced moves.
+
+**Ahmed:** *"I am not sure what workers(plural) can read the table, but RabbitMQ still decouples the
+consumers and allows horizontal scaling"* — the misconception this beat existed to clear. Walked
+naive `SELECT LIMIT 1` → all ten claim the same row → `FOR UPDATE` → nine block and go home empty,
+*worse* than useless → `SKIP LOCKED`. Plus: ten workers are ten `while(true)` loops in **one** Node
+process, not ten threads.
+
+**Ahmed then found two real costs unprompted:** (1) polling load — *"I think I just realised why they
+use Redis for message queues"*; (2) RabbitMQ's operational utilities, DLQs and dashboards. Answered
+with the arithmetic (50 qps is <1% of Postgres; bloat is the real cost, not reads), `LISTEN/NOTIFY`
+as a doorbell over a durable row, and pg-boss / Graphile Worker. **Sharpened his Redis realisation
+into the topic's key generalisation:** every option that moves the message out of Postgres
+reintroduces the dual write, so Redis solves polling by un-solving atomicity.
+
+He did not find the fanout cost, so I named it: the jobs table couples producer to consumers; a
+broker decouples them — priceless across teams, worth zero inside one service.
+
+**Closing question — what can the outbox never fix? Ahmed:** *"a crash between publishing and the
+update query completing, but its okay because an idempotent operation will just not affect the
+consistency of the system, it will just be a tiny amount of lost work."* Exactly right. Pressed only
+on *"an idempotent operation"* being load-bearing: idempotency is machinery built per side effect,
+and `available - 1` and sending an email are the two that resist it.
+
+**Landed the unifying observation:** six problems this session, one pattern — put the condition in
+the write and let the rowcount decide.
+
+**Resolved:** queue substrate → Postgres jobs table (`SKIP LOCKED` + `LISTEN/NOTIFY`). RabbitMQ moved
+to §3 as an optional bonus-point add-on for notification fanout via the outbox.
+
+---
+
 ## Where we are
 
 **Next:** Topic 3 — payment and cancellation races (failure modes B, C, D, E, I). The ambiguous

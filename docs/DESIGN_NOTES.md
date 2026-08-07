@@ -77,6 +77,7 @@ lock across it and throughput on a hot product is 0.3–10 orders/sec in *any* l
 | State transitions | CAS updates everywhere | Mandatory — makes at-least-once delivery survivable |
 | Inventory write | Atomic conditional `UPDATE` + rowcount, `CHECK (available >= 0)` | One statement, no read-write gap, no retry loop — §5.10 |
 | Deadlock avoidance | Sort line items by `product_id`; bounded retry on `40P01` | Total order on resources makes wait-cycles impossible — §5.10 |
+| **Queue substrate** | **Postgres `jobs` table — `FOR UPDATE SKIP LOCKED` + `LISTEN/NOTIFY`, via pg-boss or Graphile Worker** | No dual write, no second system to run. The broker's only irreplaceable feature is producer/consumer decoupling across teams — worth zero in a single-service submission. §5.12 |
 
 ---
 
@@ -86,8 +87,10 @@ lock across it and throughput on a hot product is 0.3–10 orders/sec in *any* l
   `GET /orders/{id}/status` as separate from `GET /orders/{id}`, which only makes sense if state
   changes after creation returns. Also required to satisfy the mandatory "Background Jobs /
   job queue" bullet. Hybrid is *also* safe given CAS — see §5.4.
-- **Queue substrate** — Postgres `SKIP LOCKED` / outbox→RabbitMQ / split by path. Ahmed favours
-  the outbox pattern.
+- **RabbitMQ as a bonus-point add-on** — `README.md:259` lists message-queue integration under
+  bonus points. Defensible move: keep the jobs table load-bearing, and add RabbitMQ *only* for
+  notification fanout via the outbox (§5.12). Demonstrates both patterns; broker failure degrades
+  notifications rather than taking down order intake. Cost is a third process and Docker service.
 - **CPU offload depth (failure mode H)** — SQL aggregation is settled. Open only on the residual
   CSV/PDF serialization: `worker_threads` with a before/after p99 benchmark, vs. simply running
   exports in the worker process. §5.8 shrank this considerably.
@@ -314,6 +317,9 @@ if (order.status === 'PENDING') {        // ← BOTH requests see PENDING
 That gap between read and write is where essentially every race in this assignment lives.
 
 ### 5.6 The dual-write problem and the five patterns
+
+> **Superseded by §5.12**, which derives all of this from first principles and resolves the queue
+> substrate. Kept for the five-pattern comparison table at the end.
 
 **What "backing the queue" means:** where job records physically live and what hands them to
 workers — a Postgres table, Redis, RabbitMQ, Kafka, or memory.
@@ -652,6 +658,246 @@ it.
 × `409`, `available = 0`, `reserved = 1`, no row ever negative. Real Postgres via Testcontainers;
 this test is meaningless against a mock or SQLite.
 
+### 5.11 Invariants — the taxonomy, and why some are cheap
+
+*Derived socratically 2026-08-07. §5.10 gave answers; this section gives the frame that generates
+them.*
+
+**Definition.** An invariant is a statement about *state* that must hold at every commit boundary,
+regardless of what ran, in what order, at what concurrency. Practical test: it's the sentence you'd
+write in the bug report if it broke — *"we sold three of an item we had two of."* Not a performance
+target ("orders processed within 5s"), not a mechanism ("the worker retries three times"): it refers
+to data only, no verbs about processes. It is also what tests assert — §8's concurrency test checks
+`available = 0`, not that the locking worked.
+
+**Why `BEGIN`/`COMMIT` alone never fixes a race.** A transaction gives atomicity and isolation from
+*uncommitted* data. It does **not** give mutual exclusion — that is a separate feature you must ask
+for. Under MVCC a plain `SELECT` takes no row lock, inside a transaction or out. So in the naive
+oversell the `UPDATE` blocks correctly, wakes correctly, and computes `0 - 1` correctly: Postgres
+executed the instruction it was given. The instruction was "subtract one." Nobody ever told it
+*"…only if stock remains"* — that sentence lived in a JavaScript `if`. **A database can only defend
+an invariant it was actually shown.** CAS is nothing more than moving the `if` into the `WHERE`,
+where the engine can see it, and where there is no gap to lose.
+
+**The four kinds:**
+
+| Kind | Example here | Defended by |
+|---|---|---|
+| **Row** — fact about one row | `available >= 0` | CAS in the `WHERE` + `CHECK` constraint |
+| **Referential** — fact about a relationship | `order_items` → real product | `FOREIGN KEY`. Free. |
+| **Uniqueness** — no two rows share a key | one capture per idempotency key | `UNIQUE` index. Free. |
+| **Set / aggregate** — fact about a collection | `SUM(pending) <= limit` | Nothing built in |
+
+**Why uniqueness is free and `SUM` isn't** — both are facts about sets. A unique index gives two
+concurrent inserters a *physical place to collide*: the index entry for that key. The phantom has an
+address. `SUM(total) <= 500` has no such rendezvous point — no page, no key, no row where the two
+transactions meet — so row locking is inert against it. Locks cannot be taken on rows that do not
+exist yet.
+
+**The technique: collapse a set invariant onto a row.** Don't defend the set — abolish it, by
+manufacturing a row for the fact to be about:
+
+```sql
+BEGIN;
+  UPDATE customers SET pending_total = pending_total + 50
+   WHERE id = 42 AND pending_total + 50 <= credit_limit;   -- rowcount 0 → 409, ROLLBACK
+  INSERT INTO orders (customer_id, total, status) VALUES (42, 50, 'PENDING');
+COMMIT;
+```
+
+Gate first, insert second, one transaction. Now the two tabs contend on customer row 42 and the
+problem is a row invariant again — plus `CHECK (pending_total <= credit_limit)` as the backstop.
+
+**The bill, part 1 — derived data rots.** `pending_total` is a cached `SUM`, and keeping it honest is
+now your job, not Postgres's. Every path that changes what's pending must move it: created, paid,
+cancelled, expired, edited, partially fulfilled, refunded. Miss one and it drifts silently — and
+drift in a *limit* is bad in both directions. Costs inherited: a discipline (or a trigger, which
+trades forgetting for hiding) and a reconciliation job that recomputes the real `SUM` and shouts.
+
+**The bill, part 2 — you created a contention point.** Throughput through the row is
+`1 / lock hold time`, and the row's *contention domain* is now the blast radius. Per-customer is
+free (Sarah isn't ordering 500/sec). Site-wide is a catastrophe.
+
+**Worked catastrophe — gapless invoice numbers.** One counter row every order must pass through:
+the ceiling applies to the whole platform, and no amount of app servers, cores, or containers moves
+it. Critically, **the lock releases at `COMMIT`, not at end of statement** — so hold time is however
+much longer the transaction lives:
+
+| Where the counter is incremented | Hold | System-wide ceiling |
+|---|---|---|
+| Last statement before `COMMIT` | ~0.5ms | ~2,000 orders/sec |
+| First statement, then inventory + order + items | ~5ms | ~200 orders/sec |
+| Inside a transaction that also calls Stripe | ~2400ms | **0.4 orders/sec** |
+
+Two rules, the second being the general one:
+
+1. **Touch a globally contended row as late in the transaction as possible** — its cost is everything
+   that happens after it.
+2. **Fix contention by shrinking the contention domain, not by speeding up the lock.** Real-world
+   R2: allocate numbers at *invoicing* — lower frequency, one serialized job, scoped per-tenant or
+   per-year. (`SEQUENCE`/`bigserial` doesn't help: `nextval` is fast *because* it's
+   non-transactional, so it leaves gaps on rollback — and gapless was the requirement.)
+
+**Invariant catalogue for this system.** In scope: I1–I3, O1–O3, P1–P2, N1. C1, R1–R3 are teaching
+examples not present in `README.md`'s spec — R1 (promo code capped site-wide) is the one that would
+actually bite during a flash sale.
+
+| | Invariant | Kind |
+|---|---|---|
+| I1 | `inventory.available >= 0` — never oversell | row |
+| I2 | `available + reserved` = physical units on hand | row |
+| I3 | `inventory.reserved` = Σ qty of all `HELD` reservations | **set** |
+| O1 | Order status only moves along legal state-machine edges | row |
+| O2 | `orders.total` = Σ its `order_items` | set (per order) |
+| O3 | A cancelled order is never subsequently paid | row, temporal |
+| P1 | At most one successful capture per order | uniqueness |
+| P2 | Σ captures for an order ≤ order total | set |
+| N1 | At most one confirmation per order per channel | uniqueness |
+| C1 | Customer pending total ≤ credit limit | set → collapsed *(not in spec)* |
+| R1 | Promo code redeemed ≤ N times site-wide | set *(not in spec)* |
+| R2 | Invoice numbers sequential, no gaps | set, site-wide *(not in spec)* |
+| R3 | Daily report totals = Σ that day's paid orders | derived, eventual |
+
+**Note I3 is a set invariant** — which is precisely why failure mode F needs a reaper rather than a
+constraint, and why §5.10's reaper CASes the *reservation* row: it collapses the set onto a row.
+
+### 5.12 The dual write, derived — and why the queue lives in Postgres
+
+*Derived socratically 2026-08-07. Supersedes the compressed table in §5.6, which stated these
+conclusions without the argument.*
+
+**The two writes.** After `POST /orders`, two facts must become true: *the order exists and stock is
+held* (Postgres) and *somebody will charge for it* (the broker). Separate calls, separate servers,
+nothing binding them.
+
+**Why no tool from §5.10–5.11 applies.** Every invariant kind in §5.11 is defended by *one engine
+that can see every write involved*. This one's writes land in two engines. It isn't a harder version
+of the problem, it's outside the frame.
+
+**The invariant is two claims.** *"Every `PENDING` order has exactly one live job"* decomposes into
+**at least one** (a job exists) and **at most one effect** (it isn't run twice). Idempotency owns the
+second completely and is **inert against the first** — crash between `COMMIT` and `publish` and there
+is no message, no consumer, nothing for a dedupe key to catch. *Idempotency is a property of the
+consumer; loss is a property of the gap between the two writes.*
+
+As stated the invariant is also unachievable — that's exactly-once delivery. The achievable version
+is **at least once delivered, at most once effective.**
+
+**Six forced moves:**
+
+1. Both facts must become true together — either alone is unacceptable (stranded order with stock
+   held; or a worker handed an order id that doesn't exist).
+2. "Together" means atomically, and atomicity is what a transaction is.
+3. No transaction spans both engines. *(AMQP transactions enroll the broker only. XA/2PC genuinely
+   solves it — rejected because a coordinator crash leaves participants blocked holding locks, broker
+   support is poor, round trips double, and it adds a new SPOF. Know why it's rejected, not just
+   that it is.)*
+4. Reordering doesn't help. DB→broker crashes into a silent stranded order; broker→DB hands the
+   consumer an order that doesn't exist, and it cannot distinguish a slow commit from a rollback.
+5. If you can't span two engines, use one — and it must be Postgres, since order + inventory need
+   each other's transaction. The broker is the negotiable part.
+6. Ask what a message physically *is*: a record saying *"someone must act on this."* Postgres stores
+   records. Write it as a row in the same transaction. The invariant becomes cross-row **inside one
+   database** — back inside §5.11's frame.
+
+> **Thesis:** you cannot eliminate failure, only choose which one. Step 6 trades an unfixable **loss**
+> problem for a fixable **duplication** problem.
+
+**Many workers on one table.** Naive `SELECT … WHERE status='pending' LIMIT 1` hands all ten workers
+the same row. Adding `FOR UPDATE` is *worse than useless*: nine block, wake, re-evaluate, find it
+claimed, and go home empty — ten workers with the throughput of one. What you want is "give me a job
+nobody has taken; if the first is taken, skip it, don't wait":
+
+```sql
+UPDATE jobs
+   SET status='processing', locked_until = now() + interval '5 minutes', attempts = attempts + 1
+ WHERE id = (SELECT id FROM jobs
+              WHERE status='pending' AND (locked_until IS NULL OR locked_until < now())
+              ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+RETURNING *;
+```
+
+The worker is a `while(true)` loop: claim → handle (no txn open during the 2400ms Stripe call) →
+mark done. **Ten workers = ten copies of that loop in one Node process**, not ten threads — each is
+awaiting I/O ~99% of the time (§5.2). Scale further with more containers. Decoupling is intact: the
+API never knows a worker exists, it commits a row.
+
+**Every broker feature is a column:**
+
+| RabbitMQ | `jobs` table |
+|---|---|
+| deliver | the claim `UPDATE` |
+| unacked message | `status='processing'`, `locked_until` in future |
+| `basic.ack` / `nack`+requeue | `status='done'` / `status='pending', locked_until=NULL` |
+| consumer dies → redelivery | `locked_until` expires, another worker reclaims |
+| prefetch | `LIMIT n` |
+| dead-letter queue | `attempts > 5 → status='failed'` |
+| delayed / priority | `run_after` column / `ORDER BY priority, id` |
+
+Plus one thing a broker structurally cannot do: **the job is still there afterwards.**
+`SELECT * FROM jobs WHERE order_id=1001` answers "what happened?" A consumed message is gone.
+
+**Polling load — the standard objection, quantified.** 10 workers × 200ms = **50 qps**, each an index
+scan over a *partial* index (`CREATE INDEX jobs_pending ON jobs (id) WHERE status='pending'`) holding
+only pending rows. Well under 1% of Postgres. Empty claims write no WAL. Real costs are the 200ms
+latency floor and **table bloat** — every job makes ≥2 row versions, so autovacuum pressure, not read
+load, is the genuine problem; archive or partition completed jobs.
+
+Then remove the objection entirely with Postgres's built-in pub/sub:
+
+```sql
+BEGIN;  INSERT INTO jobs …;  NOTIFY jobs_channel;  COMMIT;   -- fires only on commit
+```
+
+`NOTIFY` is **transactional but not durable**. It is a **doorbell; the row is the truth.** Workers
+`LISTEN` and sleep on the socket (~1ms latency, zero idle queries), with a 5-second poll retained
+purely as a safety net. Neither mechanism is load-bearing alone.
+
+**On Redis-as-queue:** fast, and `BLPOP` avoids polling — but Redis is not Postgres, so it *is the
+dual write again*. Generalise: **every option that moves the message out of Postgres reintroduces the
+dual-write problem.** Redis, RabbitMQ, Kafka, SQS — identical in this respect. The only way to have
+both is to write to Postgres first and ship onward. That is the outbox.
+
+**What the broker genuinely buys — one thing.** With a jobs table, the *producer inserts one row per
+consumer*, so it must know every consumer; adding a fraud check means editing order-payment code. A
+broker takes one `order.paid` event and lets consumers bind themselves. Worse, a Python analytics
+service polling your jobs table needs DB credentials, network access to your primary, and knowledge
+of your schema — that's a shared database, not a queue. **The jobs table couples producer to
+consumers; a broker decouples them.** Enormous across teams, exactly zero inside one service.
+
+**Operational note:** don't hand-roll. **pg-boss** and **Graphile Worker** provide `SKIP LOCKED`,
+`LISTEN/NOTIFY`, retries with backoff, dead-lettering and scheduling on top of Postgres.
+
+**What the outbox can never fix** *(Ahmed identified this unprompted)*: the relay crashing between
+`publish` and `UPDATE outbox SET sent_at` republishes on restart. Not loss — repeated work.
+
+**Idempotency is machinery, not a declaration:**
+
+| Side effect | What makes it idempotent |
+|---|---|
+| Charge a card | `Idempotency-Key: order-1001`, deduped provider-side |
+| Move order to `PAID` | CAS on `status='PENDING'` + rowcount |
+| Record a notification | `UNIQUE (order_id, channel)` |
+| `available = available - 1` | **Not idempotent** — a delta. Hence reservations as *state transitions* |
+| Send an email | **Impossible after the fact** — must claim before sending |
+
+```sql
+INSERT INTO sent_notifications (order_id, channel) VALUES (1001,'email')
+ON CONFLICT DO NOTHING RETURNING id;   -- rowcount 1 → you own it, send
+```
+
+**The unifying observation.** Six problems, one pattern — *make the condition part of the write, then
+let the rowcount decide*: overselling (`available >= 1`), double payment (`status='PENDING'`), reaper
+vs. worker (`status='HELD'`), credit limit (`pending_total + n <= limit`), job claiming
+(`SKIP LOCKED`), duplicate email (`ON CONFLICT DO NOTHING`).
+
+**And the synthesis.** ①②③ are one move — *make the "someone must act on this" record durable in the
+same transaction as the data* — differing only in where it lives: jobs table, outbox table, or the
+WAL (③ CDC exploits the record Postgres already writes). **No pattern delivers exactly-once.**
+Exactly-once *delivery* is impossible over an unreliable network (Two Generals); exactly-once
+*effect* is achievable, and that is what idempotency buys. Kafka's "exactly-once semantics" means
+at-least-once plus consumer-side dedupe — **effectively-once**.
+
 ---
 
 ## 6. Roadmap — remaining discussions
@@ -659,8 +905,9 @@ this test is meaningless against a mock or SQLite.
 | # | Topic | Covers | Status |
 |---|---|---|---|
 | 1 | Node concurrency & 1000 orders | H, J | ✅ done (§5.2) |
-| 2 | Two orders, one item | A, F, G | ✅ done (§5.10) |
-| **3** | **Payment & cancellation races** | **B, C, D, E, I** | **← next** |
+| 2 | Two orders, one item | A, F, G | ⚠️ A done (§5.10–5.11). **F and G handed over, not derived — owed** |
+| 2.5 | Invariants; the dual write; five patterns | B | ✅ done (§5.11, §5.12) |
+| **3** | **Payment & cancellation races** | **C, D, E, I** | **← after F and G** |
 | 4 | WebSockets / SSE — where real-time is standard vs cargo-cult | — | queued |
 | 5 | Redis — where caching helps vs. creates a consistency bug | — | queued |
 
