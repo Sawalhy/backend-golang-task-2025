@@ -1,4 +1,21 @@
-# Concurrent Order Processing System — Design Plan (TypeScript)
+# Concurrent Order Processing System — Design Notes
+
+> ### ⚠️ Language reversed 2026-08-09: **Go**, not TypeScript
+>
+> §1–§5.9 were written assuming a TypeScript submission under employer permission. Ahmed reversed
+> that mid-design. Rather than rewrite history, here is what the reversal touches:
+>
+> | Section | Status |
+> |---|---|
+> | §5.10–§5.17 — invariants, CAS, F/G, saga, outbox, topology, Redis | **Unaffected.** Postgres and RabbitMQ, not a language |
+> | §5.1 language analysis, §1 rubric problem | **Obsolete.** No equivalence argument to make; `DESIGN_DECISIONS.md` is no longer a deliverable |
+> | §5.2 "how Node handles 1000 orders" | **Obsolete as an argument.** The DB ceilings it identifies (pool, row locks) still hold verbatim |
+> | §5.8 isolates, `worker_threads`, .NET comparison | **Obsolete.** `go func()` replaces the whole apparatus |
+> | §5.14 typed `transition()` helper | **Weakened.** Go cannot express `Next<S>` at compile time — becomes a runtime map with a returned error |
+>
+> Roughly 85% of this document survives untouched, because almost all of it is about databases and
+> distributed systems rather than about a runtime. See `docs/IMPLEMENTATION.md` for the Go-facing
+> digest.
 
 > **Status: DESIGN IN PROGRESS.** Nothing is being built. Working through failure modes
 > pedagogically before locking architecture. Three structural decisions remain open.
@@ -70,7 +87,7 @@ lock across it and throughput on a hot product is 0.3–10 orders/sec in *any* l
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Language | TypeScript | Permission granted; Go fluency was the limiting factor |
+| Language | **Go** *(reversed 2026-08-09)* | Was TypeScript under employer permission; Ahmed switched back. Deletes the equivalence deliverable; ~85% of the design was language-independent anyway |
 | Inventory strategy | Reserve → pay → commit | Never holds a row lock across the payment network call |
 | Go-framing stance | Idiomatic Node + measured proof | Win on benchmarks, not on resemblance |
 | Process model | Two entry points, one image | `dist/api.js` + `dist/worker.js`, scaled independently |
@@ -1669,6 +1686,157 @@ customers polling every 2s is 500 qps of PK lookups, which Postgres will not not
 buys a network hop and a staleness bug on the exact value the customer is watching. **Cache things
 that are expensive to compute, not things that are merely frequent.**
 
+### 5.17 Topic 5 — Redis: where it earns its place, and where a table beats it
+
+*Derived 2026-08-09.*
+
+#### The criterion
+
+> **cache value = cost to compute × request rate × how long the answer stays correct**
+
+Most people optimise on the first two and ignore the third, which is the one that decides it.
+
+| Endpoint | Cost | Rate | Stays correct | Verdict |
+|---|---|---|---|---|
+| `products/{id}/inventory` | trivial | high | **milliseconds** | worst possible candidate — and the one people cache first |
+| `products/{id}` | trivial | high | until an admin edits | not worth it |
+| `products` (paginated) | moderate | high | until an admin edits | reasonable, second priority |
+| `admin/inventory/low-stock` | moderate | low | until stock moves | marginal |
+| `admin/reports/daily` | **high** | low | **depends — see below** | the interesting one |
+
+**Do not cache `GET /orders/{id}/status`.** It is a primary-key lookup at ~0.2ms; 1,000 customers
+polling every 2s is 500 qps, which Postgres will not notice. A cache there buys a network hop and a
+staleness bug on the exact value the customer is watching. **Cache what is expensive to compute, not
+what is merely frequent.**
+
+#### The daily report is two different objects
+
+At 14:00 the "daily report" covers `00:00 → now`. It is a **partial** day, and every order that
+completes changes it. Yesterday's report, by contrast, can never change again.
+
+| Period | Mutability | Treatment |
+|---|---|---|
+| Yesterday and earlier | **immutable** | infinite validity |
+| Today so far | changes with every order | seconds, at best |
+
+**And for the immutable half, caching is the wrong tool — materialise instead.** A
+`daily_sales_rollup` table, one row per day, written when the day closes:
+
+- survives restarts, unlike Redis by default
+- is queryable and joinable — "revenue for the last 90 days" is one indexed query, not 90 lookups
+- has no invalidation problem, because it is not a cache. It is a fact.
+
+For today's partial: compute live, or cache 60s and **label it** — *"as of 14:03:22"*. An unlabelled
+stale number is a bug report; a labelled one is a feature.
+
+Two README-worthy notes: a refund landing tomorrow for yesterday's order means "immutable" needs a
+settlement window, and real systems amend with adjusting entries rather than rewriting history. And
+*"daily"* in **whose timezone**? UTC midnight and Cairo midnight give different totals; the spec
+doesn't say — a §7 gap.
+
+#### What Redis is actually for here: rate limiting
+
+`README.md:24` makes rate-limiting middleware **mandatory**. Of the three middlewares named, JWT
+verification needs only the signing key and logging just writes — the rate limiter is the only one
+that must remember something between requests.
+
+In-process counters fail concretely: limit 100/min across four containers is really **400/min**, it
+drifts with load-balancer distribution, autoscaling silently doubles it, and a restart hands
+everyone a fresh quota. *A rate limiter that isn't shared isn't a rate limiter.*
+
+| | Reports | Rate-limit counters |
+|---|---|---|
+| Must survive restart | **yes** | no — worst case a few extra requests |
+| Queried, joined, charted | **yes** | never |
+| Write volume | once a day | **every single request** |
+| Size | grows forever | tiny, self-expiring |
+| → | **Postgres table** | **Redis** |
+
+Write volume is decisive: rate limiting means a write per request, which in Postgres is WAL, a dead
+tuple per increment, and autovacuum chasing it forever — the worst workload you could hand it.
+
+> **Postgres for facts you'll need again. Redis for state you'd shrug at losing.**
+> Redis fits when data is **ephemeral · write-heavy · shared across instances · tiny.** Rate limits
+> hit all four; reports hit none.
+
+#### Algorithms
+
+| | How | Flaw |
+|---|---|---|
+| Fixed window | `INCR user:123:12h04m`, expire 60s | Boundary burst — 100 at 11:59:59 plus 100 at 12:00:00 |
+| Sliding log | sorted set of timestamps, drop old, count | Exact, but memory grows with traffic |
+| Sliding counter | weight previous window by elapsed fraction | Approximate, cheap, no boundary burst |
+| **Token bucket** ✅ | N tokens, refill R/sec, spend 1 per request | Matches how clients behave: idle, burst, idle |
+
+**The trick that makes token bucket cheap: never refill, compute.** The naive reading needs a timer
+per user. Instead store `tokens` and `last_seen`, and on each request derive
+`tokens = min(cap, tokens + elapsed × rate)`. The bucket refills *mathematically*, only when
+somebody looks at it.
+
+#### Why it needs Lua — the seventh instance of one bug
+
+```
+tokens = GET bucket:user:123        → 1
+if (tokens >= 1) { SET bucket:user:123 tokens-1; allow() }
+```
+
+Sarah's phone and laptop, one token left:
+
+```
+t=0  phone   GET → 1
+t=1  laptop  GET → 1        ← phone hasn't written yet
+t=2  phone   1>=1 ✓ SET 0   → allowed
+t=3  laptop  1>=1 ✓ SET 0   → allowed
+```
+
+Both pass. **Redis being single-threaded does not save you** — that makes each *command* atomic, not
+each *sequence*, exactly as a Postgres row lock makes each `UPDATE` atomic while
+`SELECT`-then-`UPDATE` still races. The gap is between your two commands and Redis has no idea they
+were related.
+
+`DECR` returns the new value atomically and suffices for a plain counter. Token bucket needs two
+fields plus arithmetic, and no single command does that — hence `EVAL`, a Lua script the server runs
+to completion with nothing interleaved:
+
+```lua
+-- KEYS[1]=bucket   ARGV: capacity, rate/sec, now_ms, cost
+local cap, rate, now, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+local b      = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or cap
+local ts     = tonumber(b[2]) or now
+tokens = math.min(cap, tokens + (now - ts) / 1000 * rate)      -- lazy refill
+local allowed = 0
+if tokens >= cost then tokens = tokens - cost; allowed = 1 end
+redis.call('HSET',    KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate * 1000) + 1000)
+return { allowed, math.floor(tokens) }
+```
+
+The `PEXPIRE` bounds memory: a bucket idle long enough to fully refill is indistinguishable from a
+new one, so it can be deleted rather than accumulating a key per user forever.
+
+`WATCH`/`MULTI`/`EXEC` also works — and fails the way optimistic versioning failed in §5.10, with
+retry storms exactly under contention. Lua is the conditional-update equivalent.
+
+> Every guard this project uses is the same sentence in a different dialect:
+> `WHERE available >= 1` · `WHERE status='PENDING'` · `ON CONFLICT DO NOTHING` ·
+> `FOR UPDATE SKIP LOCKED` · `Idempotency-Key` · `EVAL`.
+
+#### When Redis is down
+
+Failover (Sentinel/Cluster) takes seconds, not zero, so you still need a policy for the window.
+
+- **Fail open** on reads and ordinary writes. A rate limiter is a *protection* mechanism, not a
+  correctness one; turning "Redis is down" into "the API is down" is strictly worse.
+- **Fail closed (`503`)** on `/auth/login` and password reset, where the rate limit *is* the security
+  control. Failing open there means unlimited password guesses at exactly the moment an attacker
+  would like it — possibly one they arranged.
+- **Fail degraded** is the better middle: an in-process fallback limiter. Per-container so the
+  effective limit is 4×, but far better than nothing.
+
+Per-endpoint policy — third time today the answer was *"make the policy an attribute, not a global"*
+(per-channel notifications in §5.14, per-channel leases, this).
+
 ---
 
 ## 6. Roadmap — remaining discussions
@@ -1680,7 +1848,12 @@ that are expensive to compute, not things that are merely frequent.**
 | 2.5 | Invariants; the dual write; five patterns | B, E | ✅ done (§5.11, §5.12, §5.13) |
 | 3 | Payment & cancellation races | C, D, I | ✅ done (§5.14) |
 | 4 | Real-time: SSE vs WebSocket vs polling; messaging topology | — | ✅ done (§5.15, §5.16) |
-| **5** | **Redis — where caching helps vs. creates a consistency bug** | — | **← next** |
+| 5 | Redis — caching vs. materialising; rate limiting | — | ✅ done (§5.17) |
+| **6** | **Go idioms — the five tells** | — | **← next, now graded rather than optional** |
+| 7 | Schema and indexing strategy | — | queued |
+| 8 | Testing strategy — unit, integration, concurrency, load | — | queued |
+| 9 | Observability — metrics, structured logging, distributed tracing | — | queued |
+| 10 | The WAL, and how CDC relates to the outbox | — | queued (§9) |
 
 **All ten failure modes are now closed.** A (§5.10), B (§5.12), C/D/I (§5.14), E (§5.12–5.13),
 F/G (§5.13), H (§5.2, §5.8), J (§5.2–5.3).
@@ -1738,6 +1911,11 @@ still completes.
 ---
 
 ## 9. Owed
+
+Requested 2026-08-09: a proper walkthrough of **the WAL and how the outbox relates to it** — what
+Postgres's write-ahead log actually is, why it exists, and how pattern ③ (CDC/Debezium) reads it
+instead of an outbox table. Referenced in passing in §5.6 and §5.12, never explained.
+
 
 Walkthrough of five non-native-Go tells: goroutine leaks, channels where a mutex belonged,
 unthreaded `context.Context`, unclosed `rows`, Java-style package layout. Deferred to a natural
