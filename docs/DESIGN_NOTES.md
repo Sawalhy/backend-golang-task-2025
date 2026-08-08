@@ -1837,6 +1837,173 @@ Failover (Sentinel/Cluster) takes seconds, not zero, so you still need a policy 
 Per-endpoint policy — third time today the answer was *"make the policy an attribute, not a global"*
 (per-channel notifications in §5.14, per-channel leases, this).
 
+### 5.18 Topic 7 — schema and indexing
+
+*2026-08-09.*
+
+#### Eleven tables, not eight
+
+`README.md:54` mandates eight. The design added three it doesn't mention — worth naming in the
+README, since being able to say *why* they exist is the point.
+
+| Added | Exists because |
+|---|---|
+| `reservations` | failure mode F — stock held against an order that may never complete |
+| `outbox` | failure mode B — the dual write (§5.12) |
+| `daily_sales_rollup` | §5.17 — the immutable half of the report wants materialising, not caching |
+
+#### The five that carry the concurrency
+
+```sql
+CREATE TABLE inventory (                       -- no status column: a counter with an invariant
+  product_id  bigint PRIMARY KEY REFERENCES products(id),
+  available   integer NOT NULL CHECK (available >= 0),
+  reserved    integer NOT NULL CHECK (reserved  >= 0),
+  version     integer NOT NULL DEFAULT 0,      -- for admin edits, not the hot path (§5.10)
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id               bigserial PRIMARY KEY,
+  user_id          bigint NOT NULL REFERENCES users(id),
+  status           order_status NOT NULL DEFAULT 'PENDING',
+  total_cents      bigint NOT NULL CHECK (total_cents >= 0),
+  currency         char(3) NOT NULL,
+  idempotency_key  text,                       -- client retry dedupe on POST /orders
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  paid_at          timestamptz,
+  cancelled_at     timestamptz
+);
+
+CREATE TABLE order_items (
+  id                bigserial PRIMARY KEY,
+  order_id          bigint NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id        bigint NOT NULL REFERENCES products(id),
+  qty               integer NOT NULL CHECK (qty > 0),
+  unit_price_cents  bigint NOT NULL,           -- SNAPSHOT, see below
+  UNIQUE (order_id, product_id)                -- forces line merging, which G needs anyway
+);
+
+CREATE TABLE reservations (
+  id          bigserial PRIMARY KEY,
+  order_id    bigint NOT NULL REFERENCES orders(id),
+  product_id  bigint NOT NULL REFERENCES products(id),
+  qty         integer NOT NULL CHECK (qty > 0),
+  status      reservation_status NOT NULL DEFAULT 'HELD',  -- HELD|COMMITTED|RELEASED|EXPIRED
+  expires_at  timestamptz NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE payments (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),  -- IS the provider idempotency key
+  order_id      bigint NOT NULL REFERENCES orders(id),
+  status        payment_status NOT NULL DEFAULT 'INITIATED', -- INITIATED|SUCCEEDED|DECLINED|UNKNOWN|REFUNDED
+  amount_cents  bigint NOT NULL,
+  provider      text NOT NULL,
+  provider_ref  text,                          -- Stripe's charge id, once known
+  attempts      integer NOT NULL DEFAULT 0,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE outbox (
+  id            bigserial PRIMARY KEY,
+  event_id      uuid NOT NULL UNIQUE,          -- consumer dedupe key
+  routing_key   text NOT NULL,
+  payload       jsonb NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  sent_at       timestamptz,
+  attempts      integer NOT NULL DEFAULT 0
+);
+
+CREATE TABLE notifications (
+  id           bigserial PRIMARY KEY,
+  order_id     bigint NOT NULL REFERENCES orders(id),
+  channel      text NOT NULL,                  -- email|sms
+  kind         text NOT NULL,                  -- confirmation|cancellation|refund
+  status       notification_status NOT NULL DEFAULT 'UNCLAIMED',
+  lease_until  timestamptz,                    -- §5.14, per-channel policy
+  attempts     integer NOT NULL DEFAULT 0,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  sent_at      timestamptz
+);
+```
+
+Three decisions inside that worth defending:
+
+- **Money is integer cents, never float.** `0.1 + 0.2 != 0.3` in IEEE 754, and it will show up in a
+  report eventually. `numeric` is the alternative; integers are faster and unambiguous.
+- **`order_items.unit_price_cents` is a snapshot.** If it were a join to `products.price`, an admin
+  raising a price would retroactively rewrite every historical order and every past report. Orders
+  record what was actually charged.
+- **`payments.id` *is* the idempotency key.** One row per payment intent, created and committed
+  before the provider call, reused across every retry of that intent (§5.14).
+
+#### Indexes
+
+Postgres does **not** auto-index foreign keys. Every FK needs one, or joins and cascades seq-scan:
+
+```sql
+CREATE INDEX ON order_items   (order_id);
+CREATE INDEX ON order_items   (product_id);
+CREATE INDEX ON reservations  (order_id);
+CREATE INDEX ON reservations  (product_id);
+CREATE INDEX ON payments      (order_id);
+CREATE INDEX ON notifications (order_id);
+```
+
+**Partial indexes for the claim queries** — these stay tiny forever, because completed rows leave the
+index entirely:
+
+```sql
+CREATE INDEX outbox_unsent    ON outbox        (id)         WHERE sent_at IS NULL;
+CREATE INDEX res_expiring     ON reservations  (expires_at) WHERE status = 'HELD';
+CREATE INDEX notif_claimable  ON notifications (id)         WHERE status IN ('UNCLAIMED','SENDING');
+```
+
+**Composites — equality column first, then sort:**
+
+```sql
+CREATE INDEX ON orders   (user_id, created_at DESC);   -- GET /orders  (a user's list)
+CREATE INDEX ON orders   (status,  created_at DESC);   -- GET /admin/orders filtered
+CREATE INDEX ON products (active,  created_at DESC);   -- GET /products
+CREATE INDEX ON orders   (created_at) WHERE status IN ('PAID','FULFILLED');  -- daily report range scan
+```
+
+**Unique indexes that are invariants, not performance** (§5.11) — these belong in migration 001:
+
+```sql
+CREATE UNIQUE INDEX ON payments      (order_id) WHERE status IN ('INITIATED','SUCCEEDED');  -- P1
+CREATE UNIQUE INDEX ON notifications (order_id, channel, kind);                             -- N1
+CREATE UNIQUE INDEX ON orders (idempotency_key) WHERE idempotency_key IS NOT NULL;
+```
+
+The partial unique on `payments` is the subtle one: many `DECLINED` attempts are legal, but at most
+one live-or-successful payment per order. That's mode C's guarantee expressed as a constraint rather
+than as code.
+
+#### What to index — and the one place not to
+
+| Earns an index | Why |
+|---|---|
+| `WHERE` columns | equality and range |
+| `ORDER BY` columns | the index supplies the order; no sort node |
+| **Foreign keys** | Postgres won't do it for you — the most common miss |
+| composite order | equality → range → sort. `(user_id, created_at)` serves `WHERE user_id=? ORDER BY created_at`; reversed it doesn't |
+
+Against all of that: **every index is a write cost** — more WAL, more bloat, more vacuum. And
+updating an *indexed* column prevents a HOT (heap-only-tuple) update, forcing index writes too.
+
+> **`inventory.available` is deliberately left unindexed.** `GET /admin/inventory/low-stock` wants an
+> index on it — but it is the most-updated column in the system, so indexing it taxes every single
+> order to speed up a query an admin runs occasionally, over a table with one row per product
+> (~10k rows, ~2ms seq scan). Take the seq scan; protect the write path. Say so in the README.
+
+Verify rather than guess: `EXPLAIN (ANALYZE, BUFFERS)` on the five hot queries, and
+`pg_stat_user_indexes` after the load test to find indexes nothing ever used.
+
 ---
 
 ## 6. Roadmap — remaining discussions
@@ -1849,11 +2016,18 @@ Per-endpoint policy — third time today the answer was *"make the policy an att
 | 3 | Payment & cancellation races | C, D, I | ✅ done (§5.14) |
 | 4 | Real-time: SSE vs WebSocket vs polling; messaging topology | — | ✅ done (§5.15, §5.16) |
 | 5 | Redis — caching vs. materialising; rate limiting | — | ✅ done (§5.17) |
-| **6** | **Go idioms — the five tells** | — | **← next, now graded rather than optional** |
-| 7 | Schema and indexing strategy | — | queued |
-| 8 | Testing strategy — unit, integration, concurrency, load | — | queued |
+| 6 | Go idioms — the five tells | — | **shelved at Ahmed's request 2026-08-09.** Still owed (§9) |
+| 7 | Schema and indexing strategy | — | ✅ done (§5.18) |
+| **8** | **Testing — unit, integration, concurrency, load** | — | **← next** |
 | 9 | Observability — metrics, structured logging, distributed tracing | — | queued |
 | 10 | The WAL, and how CDC relates to the outbox | — | queued (§9) |
+
+**Sequencing decision (2026-08-09).** Topics 8–10 do not block implementation and can follow it. Two
+things must nonetheless be right from the first commit, because retrofitting them is expensive:
+`context.Context` threaded through every I/O function (tracing propagates through it — skip it and
+topic 9 becomes a whole-codebase refactor), and the invariant-enforcing constraints in migration 001
+(adding a constraint to a table that already violates it means writing data cleanup). The
+Testcontainers harness wants to exist before build-order step 3, not after.
 
 **All ten failure modes are now closed.** A (§5.10), B (§5.12), C/D/I (§5.14), E (§5.12–5.13),
 F/G (§5.13), H (§5.2, §5.8), J (§5.2–5.3).
