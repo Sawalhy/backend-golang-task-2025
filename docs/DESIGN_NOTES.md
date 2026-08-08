@@ -1517,6 +1517,68 @@ Sarah's SSE connection pushes, the other discards.
 Adding a fraud-check service later means declaring one queue with one binding. The relay does not
 change, the order code does not change, and nobody has to know it exists.
 
+#### The code
+
+The exchange lives *inside* the broker — the point is that it is the only part of the broker a
+producer touches.
+
+```ts
+const ch = await conn.createConfirmChannel()
+await ch.assertExchange('orders', 'topic',  { durable: true })
+await ch.assertExchange('dlx',    'direct', { durable: true })
+```
+
+**Relay (producer).** Different events are not published differently — it is the same call with a
+different string:
+
+```ts
+for (const row of await db.claimUnsentBatch(100)) {      // SKIP LOCKED
+  ch.publish('orders', row.routing_key,                  // ← the only thing that varies
+    Buffer.from(JSON.stringify(row.payload)),
+    { persistent: true, messageId: row.event_id, contentType: 'application/json' })
+}
+await ch.waitForConfirms()
+await db.markSent(ids)
+```
+
+Two traps:
+
+- **`createConfirmChannel` + `waitForConfirms` is load-bearing.** Plain `ch.publish()` writes into a
+  socket buffer and returns immediately — it is *not* a delivery guarantee. Marking `sent_at` on the
+  back of it silently voids the entire outbox. Confirm first, mark second.
+- **Unroutable messages vanish silently.** If no binding matches, RabbitMQ drops the message without
+  a word. Use `mandatory: true` with a `'return'` listener, or an alternate exchange, so a typo'd
+  routing key becomes an alert rather than a mystery.
+
+**Work-queue consumer** — shared, competing, must not lose messages:
+
+```ts
+await ch.assertQueue('notifications.email', { durable: true,
+  deadLetterExchange: 'dlx', deadLetterRoutingKey: 'notifications.email.failed' })
+await ch.bindQueue('notifications.email', 'orders', 'order.paid')
+await ch.bindQueue('notifications.email', 'orders', 'order.cancelled')
+await ch.prefetch(10)
+await ch.consume('notifications.email', async msg => {
+  try   { await handleEmail(JSON.parse(msg.content.toString())); ch.ack(msg) }
+  catch { ch.nack(msg, false, false) }                   // → DLQ
+})
+```
+
+**SSE backplane consumer** — per-instance, disposable, must *not* compete:
+
+```ts
+const { queue } = await ch.assertQueue('', { exclusive: true, autoDelete: true })
+//                                      ↑ empty name → server-generated 'amq.gen-JzTY20BRg…'
+await ch.bindQueue(queue, 'orders', 'order.#')
+await ch.consume(queue, msg => {
+  const ev = JSON.parse(msg.content.toString())
+  connections.get(ev.aggregate.id)?.send(ev)             // usually undefined → discard
+}, { noAck: true })
+```
+
+The empty queue name is what stops instances competing; `exclusive + autoDelete` evaporates it when
+the container dies; `noAck` because a missed push costs nothing — the row is the truth.
+
 #### SSE and the connect race
 
 Each API instance declares its **own** exclusive queue precisely so instances do **not** compete — an
