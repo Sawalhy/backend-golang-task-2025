@@ -1396,6 +1396,219 @@ Rules that look like arbitrary style until you know the failure they prevent:
 
 ---
 
+### 5.15 Messaging topology and event schema
+
+*Derived 2026-08-09. The concrete shape of the substrate locked in §2.*
+
+#### The mental model
+
+**Producers never publish to a queue.** They publish to an **exchange** with a **routing key**, and
+have no idea who is listening.
+
+```
+publish("order.paid", body)
+        └ routing key
+                │
+        ┌───────▼───────┐
+        │   exchange    │  ← the only thing the producer knows about
+        └───────┬───────┘
+                │ compares the routing key against every BINDING
+   ┌────────────┼────────────┬──────────────┐
+   ▼            ▼            ▼              ▼
+ queue A     queue B      queue C      (no match → dropped)
+   │            │            │
+ ONE of A's  ONE of B's   ONE of C's
+ consumers   consumers    consumers
+```
+
+| Layer | Behaviour |
+|---|---|
+| exchange → queues | **Copies.** Every matching queue gets its own copy |
+| queue → consumers | **Competition.** Exactly one consumer on that queue gets it |
+
+Conflating these two is the usual source of confusion. The test when adding a consumer: *if I run a
+second copy of this, do I want the work **shared** or **duplicated**?* Shared → same queue.
+Duplicated → its own queue.
+
+| Exchange type | Rule |
+|---|---|
+| `direct` | routing key must equal binding key |
+| **`topic`** ✅ | binding key is a pattern — `*` = one word, `#` = zero or more |
+| `fanout` | routing key ignored; every bound queue gets a copy |
+| `headers` | matches on headers instead. Rare |
+
+**The broker does not know that `order.paid` "is a fanout event."** There is no such thing as a
+fanout *message*. Fanout behaviour is an emergent fact about how many bindings currently match a
+routing key. Delete two bindings and the identical message reaches one queue instead of three, with
+no change to the publishing code, which never knew. **The message does not carry its delivery
+topology — the bindings do, and consumers own the bindings.** That is the decoupling §5.12 promised.
+
+#### Event envelope
+
+Routing keys are `<aggregate>.<past-tense-event>`, lowercase, dot-separated.
+
+```json
+{
+  "eventId":    "01JQ8F3K2R7WXYZ8VN4M0PQD5T",
+  "eventType":  "order.paid",
+  "occurredAt": "2026-08-09T10:31:02.441Z",
+  "aggregate":  { "type": "order", "id": 1001 },
+  "data":       { "customerId": 42, "totalCents": 4599, "currency": "EGP" }
+}
+```
+
+- `eventId` — ULID, the consumer-side dedupe key. At-least-once means consumers **will** see repeats.
+- **The body carries identifiers, not state.** By the time a consumer opens it the state may have
+  moved on, so the event means *"something happened to order 1001, go look"* — same rule as the
+  `NOTIFY` doorbell and the claim-check pattern in §5.9. Anything authoritative is re-read from
+  Postgres.
+- The outbox row stores exactly this envelope plus the routing key, so the relay is a dumb pipe.
+
+#### Topology
+
+Exchange `orders`, type `topic`, durable.
+
+| Queue | Binding | Consumers | Kind |
+|---|---|---|---|
+| `payments` | `order.created` | N payment workers | durable, competing |
+| `notifications.email` | `order.paid`, `order.cancelled`, `order.failed` | N email workers | durable, competing |
+| `notifications.sms` | `order.paid`, `order.cancelled` | N sms workers | durable, competing |
+| `refunds` | `payment.refund_requested` | N refund workers | durable, competing |
+| `analytics` | `order.#` | 1 Python service | durable, competing |
+| `sse.<instance-id>` | `order.#` | that API instance only | **exclusive, auto-delete** |
+
+Dead-lettering: every durable queue declares `x-dead-letter-exchange: dlx` and
+`x-dead-letter-routing-key: <queue>.failed`; `dlx` is a `direct` exchange with one DLQ per source, so
+a poisoned message is traceable to where it came from.
+
+**Email and SMS must not share a queue.** If they did, one `order.paid` would go to a single consumer
+and the customer would get an email *or* a text, never both. Each *job that must happen* gets its own
+queue; each queue gets N consumers *for throughput*.
+
+#### Two worked propagations
+
+**`order.created`** — published by the relay after the order transaction commits:
+
+| Queue | Binding | Match |
+|---|---|---|
+| `payments` | `order.created` | ✅ |
+| `notifications.email` | `order.paid`, `order.cancelled`, `order.failed` | ✗ |
+| `notifications.sms` | `order.paid`, `order.cancelled` | ✗ |
+| `analytics` | `order.#` | ✅ |
+| `sse.api-1`, `sse.api-2` | `order.#` | ✅ ✅ |
+
+→ **4 copies.** The `payments` copy goes to exactly one of the N payment workers, which claims it,
+charges the card, and CASes the order.
+
+**`order.paid`** — published after that CAS:
+
+| Queue | Match |
+|---|---|
+| `payments` | ✗ |
+| `notifications.email` | ✅ |
+| `notifications.sms` | ✅ |
+| `analytics` | ✅ |
+| `sse.api-1`, `sse.api-2` | ✅ ✅ |
+
+→ **5 copies.** Email and SMS are sent independently by different worker pools; either can fail
+without affecting the other. Both API instances check their local connection map — whichever holds
+Sarah's SSE connection pushes, the other discards.
+
+Adding a fraud-check service later means declaring one queue with one binding. The relay does not
+change, the order code does not change, and nobody has to know it exists.
+
+#### SSE and the connect race
+
+Each API instance declares its **own** exclusive queue precisely so instances do **not** compete — an
+event that reached only one instance would probably reach the wrong one, and the customer holding a
+connection on another would see nothing.
+
+Naive `connect → read → emit → subscribe` still drops events:
+
+```
+t=0  connect
+t=1  read order → PENDING, emit
+t=2  worker CASes → PAID, event fans out     ← not subscribed yet. Lost.
+t=3  subscribe → waits forever. Screen says PENDING; order is PAID.
+```
+
+Worse than no real-time at all, since polling would have caught it on the next tick.
+
+**Correct order: `subscribe (buffering) → read → emit → flush buffer → stream live`.** Anything
+firing during the read lands in the buffer. The client must render idempotently — trivial here,
+because order status is monotonic along the state machine (§5.14), so it discards any event whose
+state precedes what it already shows.
+
+Plus a re-read every 15s on the open connection. **The event path buys speed, the time path buys
+correctness** — fourth appearance of the same rule (F's reaper, `LISTEN/NOTIFY` + polling,
+notification leases, this).
+
+Reading current state on connect also makes the connection **session-agnostic** *(Ahmed's
+observation)*: SSE auto-reconnects to whichever instance the load balancer picks, that instance reads
+state and catches the client up. No sticky sessions, no shared connection registry.
+
+### 5.16 Real-time — which of the spec's three features earns a live connection
+
+*Derived 2026-08-09.*
+
+`README.md:110` lists three "Real-time Features" as peers — inventory updates, order status, instant
+notifications — in the **main body**, with no transport named. WebSocket appears only at
+`README.md:256` under **Bonus Points**. So the requirement is the capability; SSE satisfies it and
+WebSocket specifically claims the bonus.
+
+**First, the reframe** *(Ahmed's)*: **this is a UX question, not a correctness one.** Everything in
+§5.10–5.14 means a stale screen cannot cause a wrong outcome. Worth stating in the README, because
+plenty of people build real-time inventory believing it is a safety mechanism.
+
+| | Order status | Inventory |
+|---|---|---|
+| Recipients per event | **1** | everyone viewing that product — unbounded |
+| Authenticated | yes | mostly anonymous |
+| Actually waiting | **yes**, watching "processing" | no — browsing, comparing |
+| Connection lifetime | seconds to minutes, then terminal | indefinite; a tab open for hours |
+| Fanout | 1 event → 1 recipient | 1 purchase → N pushes |
+
+The last row decides it: **inventory push is worst exactly when you can least afford it** — a flash
+sale means maximum purchases *and* maximum viewers simultaneously, so volume scales roughly with
+demand squared. Status connections scale linearly with orders.
+
+And the argument that makes status non-negotiable: **going async created the need.** A synchronous
+pipeline returns `201 PAID` and there is nothing to track. The 202 is what produced a customer
+sitting in front of a `PENDING` order — so live status is the other half of the pipeline decision,
+not a bolt-on.
+
+**Correcting the usual intuition about connection counts:** idle connections are *cheap*. Node uses
+`epoll` — one thread multiplexing all of them, not a thread each. 10,000 idle WebSockets is roughly
+100–500MB and no CPU; C10K was solved around 2000. What costs is **messages**: 10,000 connections
+receiving 50 events/sec is 500k messages/sec and the process is dead. Status connections are idle
+almost their whole life; inventory connections on a hot product are firehoses. It was never the
+socket count.
+
+| | Polling | **SSE** ✅ | WebSocket |
+|---|---|---|---|
+| Direction | request/response | server → client | both |
+| Protocol | HTTP | HTTP | upgrade to `ws://` |
+| Reconnect | n/a | **built in** (`Last-Event-ID`) | you write it |
+| Proxy/CDN friendly | yes | yes | often not |
+| Right when | updates rare, latency irrelevant | **client only listens** | client also sends |
+
+**SSE for order status**, because Sarah's browser needs to send nothing — a bidirectional protocol
+solves a problem she does not have. Gotcha worth knowing: HTTP/1.1 caps ~6 connections per origin,
+so many concurrent streams per tab is a problem; HTTP/2 multiplexing lifts it.
+
+**No real-time inventory push.** Instead: revalidate before add-to-cart, refetch on tab focus, and
+show bands (`In stock` / `Only a few left` / `Sold out`) rather than exact counts, since bands change
+far less often. Honest exceptions where inventory push genuinely earns it: ticketing, limited drops,
+seat maps, auctions — anywhere the item is truly contended and the customer is deciding *now*.
+Stating in the README what you deliberately did **not** build, and why, is the senior move.
+
+**Do not put Redis in front of `GET /orders/{id}/status`.** It is a primary-key lookup, ~0.2ms; 1,000
+customers polling every 2s is 500 qps of PK lookups, which Postgres will not notice. A cache there
+buys a network hop and a staleness bug on the exact value the customer is watching. **Cache things
+that are expensive to compute, not things that are merely frequent.**
+
+---
+
 ## 6. Roadmap — remaining discussions
 
 | # | Topic | Covers | Status |
@@ -1404,8 +1617,8 @@ Rules that look like arbitrary style until you know the failure they prevent:
 | 2 | Two orders, one item | A, F, G | ✅ done (§5.10, §5.13) |
 | 2.5 | Invariants; the dual write; five patterns | B, E | ✅ done (§5.11, §5.12, §5.13) |
 | 3 | Payment & cancellation races | C, D, I | ✅ done (§5.14) |
-| **4** | **WebSockets / SSE — where real-time is standard vs cargo-cult** | — | **← next** |
-| 5 | Redis — where caching helps vs. creates a consistency bug | — | queued |
+| 4 | Real-time: SSE vs WebSocket vs polling; messaging topology | — | ✅ done (§5.15, §5.16) |
+| **5** | **Redis — where caching helps vs. creates a consistency bug** | — | **← next** |
 
 **All ten failure modes are now closed.** A (§5.10), B (§5.12), C/D/I (§5.14), E (§5.12–5.13),
 F/G (§5.13), H (§5.2, §5.8), J (§5.2–5.3).
