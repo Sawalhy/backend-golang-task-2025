@@ -1209,6 +1209,57 @@ deliberately per channel — an SMS that costs money may prefer the opposite.
 > **One skeleton, three tables:** jobs (`pending → processing+lease → done`), reservations
 > (`HELD → CHARGING+expiry → COMMITTED`), notifications (`unclaimed → sending+lease → sent`).
 
+**Why "check the provider before sending" isn't the answer** *(Ahmed's proposal — worth recording
+because it's the natural instinct)*. *Check whether it was sent → if not, send it* is `SELECT`, `if`,
+write — **the read-then-write gap**, with the provider standing in for the database. Two consumers
+check simultaneously, both get "not sent," both send. Three practical problems on top: a
+transactional email API is not an inbox and support varies wildly (Postmark and Mailgun let you
+search by metadata, SES gives you nothing unless you wired event publishing yourself); the log is
+**eventually consistent**, so "no record" can mean "sent 300ms ago" — least reliable exactly in the
+window you care about; and retention runs out.
+
+| Tier | Approach | Verdict |
+|---|---|---|
+| 1 | Provider idempotency key | Best — atomic, no gap, no indexing lag. Stripe and Resend have it; most email providers don't |
+| 2 | Lease + accept duplicates | What we build. Portable, no extra calls |
+| 3 | Query the provider's log | Good as *periodic reconciliation*; bad in the hot path |
+
+Tier 1 is the same move as everything else: the provider letting you **put the condition inside the
+write** rather than checking first — `Idempotency-Key`, `WHERE available >= 1`,
+`ON CONFLICT DO NOTHING`, `FOR UPDATE SKIP LOCKED`. All one idea.
+
+**Per-channel lease policy** *(Ahmed's design)*. Identical claim, identical lease, identical CAS —
+one config column picks the terminal edge:
+
+```
+email:  SENDING --lease expires--> UNCLAIMED   (auto-retry; duplicate acceptable)
+otp:    SENDING --lease expires--> UNKNOWN     (stop, escalate; duplicate harmful)
+```
+
+Call the state **`UNKNOWN`, never `FAILED`** — `FAILED` claims knowledge you don't have and invites
+someone to write a well-meaning auto-retry for it. It also makes the metric meaningful: rising
+`UNKNOWN` means *workers are dying*, which is what you want to be paged for.
+
+**The axis is not cost.** 4¢ per duplicate SMS is nothing at real volume — you'd need 25,000 to lose
+$1,000. Duplicates on a phone read as a broken system or a fraud signal, so the *content* sets the
+policy, not the channel. And escalation needs an audience: "let the user resend" works for an OTP
+where someone is watching the screen, and is useless for an order confirmation Sarah doesn't know
+exists.
+
+> **Match the delivery guarantee to what a miss costs.** Most notifications cost little because the
+> information is durably somewhere else — Sarah's order is in her account regardless. Build the
+> expensive guarantee only where a miss is blocking or a trust problem.
+
+| Content | Miss costs | Policy |
+|---|---|---|
+| OTP | Blocking; user is waiting | `UNKNOWN` + resend button + rate limit |
+| Order confirmation | Cosmetic; order is in her account | Auto-retry, alert on the rate |
+| "Your card was charged" | Trust / compliance | Strong path, operator escalation |
+
+Cheap mitigation regardless: the duplicate window is only between "provider accepted" and "we wrote
+`SENT`". Write `SENT` in its own immediate transaction with nothing else in it — doesn't close the
+window, makes it sub-millisecond.
+
 #### The state machines
 
 Four tables have a lifecycle; the rest are just data. Not `users`, `products`, `order_items`,
