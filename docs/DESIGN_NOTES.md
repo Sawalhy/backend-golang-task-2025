@@ -1065,7 +1065,7 @@ block — and that is true of raw SQL and ORMs alike, the line is *database vs. 
 hold time and pool exhaustion (§5.7), turns out to be the same rule that makes deadlock retry safe.
 **Two independent derivations of one rule** — usually the sign it is real rather than a heuristic.
 
-#### Tests these earn
+#### Tests F and G earn
 
 - Reserve, never pay, backdate `expires_at`, run reaper → stock restored, order `EXPIRED`,
   `available + reserved` still equals physical stock.
@@ -1076,6 +1076,273 @@ hold time and pool exhaustion (§5.7), turns out to be the same rule that makes 
 - **The G deadlock:** two multi-item orders with reversed line items, fired concurrently → both
   succeed, zero `40P01` surfaced to the client.
 
+### 5.14 Topic 3 — payment and cancellation races (C, D, I)
+
+*Derived socratically 2026-08-07.*
+
+#### The pipeline is a saga *(Ahmed named it)*
+
+A **saga** is what you use when a business operation spans things that cannot share a transaction:
+decompose it into local transactions, each with a **compensating action** that semantically undoes
+it. Compensation is not rollback — you cannot un-charge a card, you issue a refund, and both
+movements are on the statement forever. It restores the business meaning, not the state.
+
+| Step | Local transaction | Compensation |
+|---|---|---|
+| Reserve stock | `UPDATE inventory … available >= 1` | Release the reservation |
+| Charge payment | Stripe, idempotency-keyed | **Refund** |
+| Commit reservation | CAS `HELD → COMMITTED` | Restock |
+| Notify | Insert outbox row | Send a correction, or accept |
+
+Ours is **choreographed** (consumers react to events; `orders.status` is the implicit saga state),
+not **orchestrated** (a central coordinator drives steps and invokes compensations — Temporal, Step
+Functions). Note when writing the README: "saga" is a 1987 paper about long-lived transactions in a
+*single* database, later borrowed by the microservices world. *"The order pipeline is a choreographed
+saga; `orders.status` is the saga state; here are the compensations"* is accurate. Claiming a saga
+orchestrator when you have a status column and four consumers reads worse than describing what you
+built.
+
+#### C — the ambiguous timeout
+
+The consumer sends the charge; 30 seconds later the HTTP request times out. **The timeout tells you
+nothing.** The request may never have reached Stripe, may have been processed with the response lost
+on the way back, or may still be in flight. Three different worlds, one identical observation.
+
+**Idempotency keys beat polling.** With `Idempotency-Key` on the original request you don't ask what
+happened — you **resend the identical request**. Stripe returns the original response if it already
+processed it, or processes it now. One call that both discovers the truth and repairs it, with no
+possibility of a second charge. Polling is the fallback for providers without keys, and it needs the
+same prerequisite anyway: a correlation id attached up front.
+
+Which is the constraint: **you cannot add the key after the timeout.** Recovery is designed before
+the failure, not in response to it.
+
+**Where the key lives** *(Ahmed's answer)*: a `payments` row, written **and committed** before the
+call. Not merely inserted — if it is still inside an open transaction when the process dies it rolls
+back and the key vanishes, and you would also be holding a transaction open across a network call.
+Two transactions with the call between them: the reserve→pay→commit shape again.
+
+**Granularity** — the key belongs to one payment *intent*:
+
+| Scope | Result |
+|---|---|
+| Per attempt | New key each retry → five charges. **The bug.** |
+| Per order | Too coarse — a legitimate re-charge after a refund would be suppressed |
+| **Per `payments` row** | **Correct.** All retries of that intent reuse its id |
+
+Stripe's PaymentIntent is exactly this object. Caveat: their keys expire after 24h, so a retry
+schedule stretching past a day loses the protection.
+
+> **The recurring shape, third instance: write down what you are about to do, before you do it.**
+> The outbox does it for messages, the reservation for stock, the `payments` row for money. After a
+> crash, that record is the only thing that knows what you were in the middle of.
+
+#### D — cancel arrives mid-saga
+
+Not in the spec (§7) and the subtlest correctness bug here.
+
+CAS decides **who owns a state transition** — cancel tries `PENDING → CANCELLED`, the consumer tries
+`PENDING → CHARGING`, one gets rowcount 1 and the loser does nothing dangerous. If cancel wins the
+consumer never calls Stripe at all: no charge, no refund, clean. **This covers the common case**,
+since most cancels arrive before payment starts.
+
+What CAS cannot do is reach into an HTTP request that has already left the process. For that window:
+
+| | Design |
+|---|---|
+| **A — refuse** | Cancel CASes on `PENDING`; rowcount 0 → `409 "payment in progress"` |
+| **B — accept as intent** ✅ | Cancel CASes `PENDING\|CHARGING → CANCELLING` → `202`. Consumer reads the state when Stripe answers and compensates if needed |
+
+**B, decisively.** A doesn't avoid the refund, it avoids *automating* it — the customer emails
+support and someone refunds by hand. Meanwhile cancel is dead for however long the payment retries.
+And **the refund path already exists**: F's reaper-wins-then-Stripe-approves branch is the identical
+situation. B's extra cost is zero; A's saving is imaginary.
+
+The consumer returns from Stripe holding "approved" and tries two CASes in order:
+
+```sql
+UPDATE orders SET status='PAID', paid_at=now() WHERE id=$1 AND status='CHARGING';
+-- rowcount 1 → commit reservation, emit confirmation. Done.
+
+UPDATE orders SET status='CANCELLED_REFUNDED' WHERE id=$1 AND status='CANCELLING';
+-- rowcount 1 → in the SAME transaction, INSERT outbox row for refund_payment
+```
+
+Whichever matches tells the consumer which world it woke up in. No read-then-decide gap.
+
+**Frustration cancels are a product problem, not a state-machine problem** *(Ahmed's distinction)*.
+The backend makes every outcome correct; the UI discourages the expensive ones — *"Payment is being
+processed — cancelling now means a refund, which takes 5–10 days."* Never refuse a cancel *because*
+you suspect impatience: that is guessing at intent, and you will be wrong for the people who meant it.
+
+#### I — notification sent twice, or never
+
+The guard is a claim before sending. But look at the two statements:
+
+```sql
+INSERT INTO sent_notifications (order_id, channel) VALUES ($1,'email')
+ON CONFLICT DO NOTHING RETURNING id;
+```
+```ts
+if (claimed) await emailProvider.send(...)
+```
+
+**That is the dual write again, one level down** *(Ahmed spotted this unprompted: "the email sending
+and logging that we sent an email will always have to be separate events")*. And the ordering only
+selects which failure you get:
+
+| Order | Crash in the gap |
+|---|---|
+| Send → record | **Duplicate.** Redelivery sends a second email |
+| Record → send | **Silent permanent loss.** Every redelivery hits the conflict and concludes "already sent" |
+
+Provider-side idempotency keys would fix it but are inconsistent across email providers, unlike
+Stripe. Querying the provider for "did I send this" needs a correlation id attached up front — C's
+prerequisite again.
+
+**The resolution is the lease, for the third time:** `claim (status='SENDING', lease 2min)` → `send`
+→ `mark SENT`. Die between claim and send and the lease expires and it retries: **silent permanent
+loss becomes delay**, at the cost of a duplicate in a narrow window. Right trade for email, where a
+duplicate confirmation is mildly annoying and a missing one is a support ticket. Choose the failure
+deliberately per channel — an SMS that costs money may prefer the opposite.
+
+> **One skeleton, three tables:** jobs (`pending → processing+lease → done`), reservations
+> (`HELD → CHARGING+expiry → COMMITTED`), notifications (`unclaimed → sending+lease → sent`).
+
+#### The state machines
+
+Four tables have a lifecycle; the rest are just data. Not `users`, `products`, `order_items`,
+`audit_logs` — and notably **not `inventory`**, which has no states at all: it is a counter with an
+invariant, which belongs in §5.11's catalogue instead.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> PENDING
+    PENDING --> CHARGING: consumer claims
+    PENDING --> CANCELLED: cancel, pre-charge
+    PENDING --> EXPIRED: reaper, TTL elapsed
+    CHARGING --> PAID: Stripe approves
+    CHARGING --> FAILED: permanent decline
+    CHARGING --> CANCELLING: cancel, mid-flight
+    CANCELLING --> CANCELLED: charge never happened
+    CANCELLING --> CANCELLED_REFUNDED: charge succeeded, refund issued
+    PAID --> FULFILLED: warehouse confirms
+    PAID --> REFUNDED: later refund
+    CANCELLED --> [*]
+    CANCELLED_REFUNDED --> [*]
+    EXPIRED --> [*]
+    FAILED --> [*]
+    FULFILLED --> [*]
+    REFUNDED --> [*]
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> INITIATED: row committed BEFORE the Stripe call
+    INITIATED --> SUCCEEDED: approved
+    INITIATED --> DECLINED: refused
+    INITIATED --> UNKNOWN: timeout — mode C
+    UNKNOWN --> SUCCEEDED: resend with same key
+    UNKNOWN --> DECLINED: resend with same key
+    SUCCEEDED --> REFUNDED: compensation
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> HELD: reserved in the order txn
+    HELD --> COMMITTED: payment succeeded
+    HELD --> RELEASED: decline or pre-charge cancel
+    HELD --> EXPIRED: reaper — mode F
+    COMMITTED --> RESTOCKED: refund compensation
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> UNCLAIMED
+    UNCLAIMED --> SENDING: claim + lease
+    SENDING --> SENT: provider accepted
+    SENDING --> UNCLAIMED: lease expired — retry
+    SENDING --> DEAD: attempts exhausted
+```
+
+**A diagram of boxes and arrows is decoration.** What makes it a specification is the guard on every
+edge:
+
+| From | To | Guard (CAS predicate) | Triggered by | Compensation |
+|---|---|---|---|---|
+| `PENDING` | `CHARGING` | `status='PENDING'` | payment consumer claims | release reservation |
+| `PENDING` | `CANCELLED` | `status='PENDING'` | customer cancels pre-charge | — |
+| `PENDING` | `EXPIRED` | `status='PENDING'` | reaper | — |
+| `CHARGING` | `PAID` | `status='CHARGING'` | Stripe approves | refund |
+| `CHARGING` | `FAILED` | `status='CHARGING'` | permanent decline | release reservation |
+| `CHARGING` | `CANCELLING` | `status IN ('PENDING','CHARGING')` | customer cancels mid-flight | — |
+| `CANCELLING` | `CANCELLED` | `status='CANCELLING'` | charge never happened | — |
+| `CANCELLING` | `CANCELLED_REFUNDED` | `status='CANCELLING'` | charge succeeded | — |
+
+#### Making it code rather than discipline
+
+The map is the specification, and the docs above are derived from it — a table that can drift from
+the code will drift.
+
+```ts
+export const ORDER_TRANSITIONS = {
+  PENDING:    ['CHARGING', 'CANCELLED', 'EXPIRED'],
+  CHARGING:   ['PAID', 'FAILED', 'CANCELLING'],
+  CANCELLING: ['CANCELLED', 'CANCELLED_REFUNDED'],
+  PAID:       ['FULFILLED', 'REFUNDED'],
+  FULFILLED: [], CANCELLED: [], CANCELLED_REFUNDED: [],
+  EXPIRED: [], FAILED: [], REFUNDED: [],
+} as const satisfies Record<OrderStatus, readonly OrderStatus[]>
+
+type Next<S extends OrderStatus> = (typeof ORDER_TRANSITIONS)[S][number]
+
+/** Returns true if THIS caller performed the transition. False means someone else already did. */
+export async function transition<S extends OrderStatus>(
+  tx: Tx, orderId: number, from: S, to: Next<S>,
+): Promise<boolean> {
+  const res = await tx.execute(sql`
+    UPDATE orders SET status = ${to}, updated_at = now()
+     WHERE id = ${orderId} AND status = ${from}
+  `)
+  return res.rowCount === 1
+}
+```
+
+Two things this buys. **Illegal transitions stop compiling** — `Next<S>` means
+`transition(tx, id, 'PAID', 'CHARGING')` is a type error, not a runtime bug. And the CAS is
+unskippable, because there is no other way to change a status. O1 stops being a rule everyone must
+remember and becomes a property of the code — the same instinct as `CHECK (available >= 0)`.
+
+Two tests fall out nearly free: every pair in the map is reachable, and every pair not in it is
+rejected.
+
+*Worth noting for the Go↔TS equivalence argument in §1: compile-time-checked state transitions are a
+place where the TypeScript version is genuinely stronger than the idiomatic Go one, where this is
+usually a runtime map lookup. Concrete evidence that the substitution was a choice, not a dodge.*
+
+#### For CLAUDE.md when implementation starts
+
+Rules that look like arbitrary style until you know the failure they prevent:
+
+- Never write `orders.status` directly. Use `transition()` and check the result.
+- Every state change is a CAS. Check the rowcount; **rowcount 0 means you lost, not that it failed.**
+- Sort line items by `product_id` before touching `inventory`.
+- Never do network I/O inside a transaction.
+- Idempotency keys come from the `payments` row and never change across retries.
+
+#### Tests C, D and I earn
+
+- **C:** kill the consumer mid-charge, redeliver → exactly one charge at Stripe (assert against the
+  mock's recorded idempotency keys, not just the local row).
+- **D:** fire `cancel` and the payment consumer concurrently on a `PENDING` order → either a clean
+  cancel with no charge, or a charge followed by a refund outbox row. Never a charged live order.
+- **I:** redeliver a notification message 5× → exactly one send; kill between claim and send → the
+  email still goes out after the lease expires.
+
 ---
 
 ## 6. Roadmap — remaining discussions
@@ -1085,9 +1352,12 @@ hold time and pool exhaustion (§5.7), turns out to be the same rule that makes 
 | 1 | Node concurrency & 1000 orders | H, J | ✅ done (§5.2) |
 | 2 | Two orders, one item | A, F, G | ✅ done (§5.10, §5.13) |
 | 2.5 | Invariants; the dual write; five patterns | B, E | ✅ done (§5.11, §5.12, §5.13) |
-| **3** | **Payment & cancellation races** | **C, D, I** | **← next** |
-| 4 | WebSockets / SSE — where real-time is standard vs cargo-cult | — | queued |
+| 3 | Payment & cancellation races | C, D, I | ✅ done (§5.14) |
+| **4** | **WebSockets / SSE — where real-time is standard vs cargo-cult** | — | **← next** |
 | 5 | Redis — where caching helps vs. creates a consistency bug | — | queued |
+
+**All ten failure modes are now closed.** A (§5.10), B (§5.12), C/D/I (§5.14), E (§5.12–5.13),
+F/G (§5.13), H (§5.2, §5.8), J (§5.2–5.3).
 
 **Topic 3 outline (next up):** the ambiguous payment timeout — you sent the charge, the connection
 died, you do not know if the customer was charged (C); idempotency keys and why the key must be
