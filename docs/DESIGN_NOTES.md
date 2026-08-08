@@ -77,7 +77,8 @@ lock across it and throughput on a hot product is 0.3–10 orders/sec in *any* l
 | State transitions | CAS updates everywhere | Mandatory — makes at-least-once delivery survivable |
 | Inventory write | Atomic conditional `UPDATE` + rowcount, `CHECK (available >= 0)` | One statement, no read-write gap, no retry loop — §5.10 |
 | Deadlock avoidance | Sort line items by `product_id`; bounded retry on `40P01` | Total order on resources makes wait-cycles impossible — §5.10 |
-| **Queue substrate** | **Postgres `jobs` table — `FOR UPDATE SKIP LOCKED` + `LISTEN/NOTIFY`, via pg-boss or Graphile Worker** | No dual write, no second system to run. The broker's only irreplaceable feature is producer/consumer decoupling across teams — worth zero in a single-service submission. §5.12 |
+| **Queue substrate** | **Outbox → relay → RabbitMQ, for every async handoff** | Ahmed's call 2026-08-07: if the broker is in (bonus point, `README.md:259`), keep one mechanism rather than two. The outbox is non-negotiable either way — a broker never removes the table, it only adds to it (§5.12). Relay claims batches with `SKIP LOCKED` so two instances can't double-publish. |
+| Scheduled work | Periodic loop in the worker process, **not** a consumer | A queue delivers "something happened." The reaper's trigger is *"Sarah still hasn't paid"* — the absence of an event is not an event. State this in the README so it doesn't read as an oversight. |
 
 ---
 
@@ -87,10 +88,10 @@ lock across it and throughput on a hot product is 0.3–10 orders/sec in *any* l
   `GET /orders/{id}/status` as separate from `GET /orders/{id}`, which only makes sense if state
   changes after creation returns. Also required to satisfy the mandatory "Background Jobs /
   job queue" bullet. Hybrid is *also* safe given CAS — see §5.4.
-- **RabbitMQ as a bonus-point add-on** — `README.md:259` lists message-queue integration under
-  bonus points. Defensible move: keep the jobs table load-bearing, and add RabbitMQ *only* for
-  notification fanout via the outbox (§5.12). Demonstrates both patterns; broker failure degrades
-  notifications rather than taking down order intake. Cost is a third process and Docker service.
+- **Job state visibility** — RabbitMQ is transport, not storage (§5.9), so once a message is consumed
+  you cannot ask "what happened to order 1001's charge?" `GET /orders/{id}/status` is mandatory at
+  `README.md:87`, so *some* table must record attempt/outcome state regardless. Open question is
+  only whether that lives on `orders` itself or in a separate `payment_attempts` table.
 - **CPU offload depth (failure mode H)** — SQL aggregation is settled. Open only on the residual
   CSV/PDF serialization: `worker_threads` with a before/after p99 benchmark, vs. simply running
   exports in the worker process. §5.8 shrank this considerably.
@@ -610,7 +611,7 @@ admin-side edits (§ product update endpoints), where think-time is real.
 | Needs app-side retry | no | **no** | yes |
 | Good for | multi-row decisions | **hot counters** | low-contention edits |
 
-**Failure mode F — the abandoned reservation**
+**Failure mode F — the abandoned reservation** *(superseded by §5.13, which derives it)*
 
 Reserve→pay→commit means stock leaves `available` at reserve time. If payment never resolves
 (customer abandons, worker dies), the unit is stranded in `reserved` forever. Requires:
@@ -631,7 +632,7 @@ succeeds, the correct behaviour is a refund, not a crash — so `PAYMENT_CAPTURE
 `RESERVATION_EXPIRED` is a real state the machine must model. Set the TTL well above the payment
 timeout (15 min vs 30 s) so this is rare, not routine.
 
-**Failure mode G — deadlock on multi-item orders**
+**Failure mode G — deadlock on multi-item orders** *(superseded by §5.13, which derives it)*
 
 ```
 Order A: [mouse(7), keyboard(3)]        Order B: [keyboard(3), mouse(7)]
@@ -812,7 +813,8 @@ nobody has taken; if the first is taken, skip it, don't wait":
 UPDATE jobs
    SET status='processing', locked_until = now() + interval '5 minutes', attempts = attempts + 1
  WHERE id = (SELECT id FROM jobs
-              WHERE status='pending' AND (locked_until IS NULL OR locked_until < now())
+              WHERE status IN ('pending','processing')      -- NOT status='pending' alone: see §5.13
+                AND (locked_until IS NULL OR locked_until < now())
               ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
 RETURNING *;
 ```
@@ -898,6 +900,182 @@ Exactly-once *delivery* is impossible over an unreliable network (Two Generals);
 *effect* is achievable, and that is what idempotency buys. Kafka's "exactly-once semantics" means
 at-least-once plus consumer-side dedupe — **effectively-once**.
 
+### 5.13 Failure modes F and G, derived
+
+*Redone socratically 2026-08-07 at Ahmed's insistence — §5.10 stated the solutions without earning
+them. Supersedes the F and G blocks there.*
+
+#### Two things called "lock", and only one is real
+
+The single biggest source of confusion in this topic:
+
+| | Postgres row lock | `locked_until` |
+|---|---|---|
+| What it is | A real lock the engine enforces | A timestamp in a column |
+| Enforced by | Postgres — unbypassable | **Nobody.** Your own queries agree to honour it |
+| Lifetime | Microseconds, released at `COMMIT` | Minutes |
+| Protects against | Two workers claiming the same row simultaneously | A job orphaned by a dead worker |
+
+`FOR UPDATE SKIP LOCKED` is the first. `locked_until` is a **lease** and Postgres knows nothing about
+it. Both appear in the same claim statement with different lifetimes.
+
+#### The claim, and the bug in §5.12's first draft
+
+A job row carries two separable things: **the work** (`type`, `order_id` — durable truth, written in
+the business transaction) and **the claim** (`status`, `locked_until`, `attempts` — ephemeral
+bookkeeping about who is currently holding it). An expired lease invalidates the claim and says
+nothing about the work, which still needs doing. *The book is fine; the loan went overdue.*
+
+A job is therefore available if **it was never claimed, or its claim has lapsed**:
+
+```sql
+WHERE status = 'pending'
+   OR (status = 'processing' AND locked_until < now())
+```
+
+The first draft in §5.12 had only `status='pending'`, which never matches a dead worker's job —
+the lease machinery exists, the clock runs out, and nothing ever looks. **Invisible in every test
+where the worker doesn't die**, i.e. every test one would naturally write.
+
+**The lease is a guess about liveness, and guesses are wrong.** A worker that is alive but stalled
+(GC pause, hung TCP) loses its lease while still working; a second worker claims the same job and
+the payment is attempted twice. This is why the jobs table is *also* at-least-once, exactly like a
+broker, and why idempotency was never optional. Duration is the trade: too short steals jobs from
+healthy-but-slow workers, too long leaves dead workers' jobs idle. Stripe at 2.4s typical / 30s worst
+case → a 5-minute lease is ~10× margin. Genuinely long jobs **heartbeat** instead — extend your own
+deadline while working, rather than borrowing for a year.
+
+#### F — where the hole actually is
+
+Trace a permanently declined card. The consumer retried, exhausted its attempts, and the message went
+to the DLQ. *That part worked.* But a DLQ is a place messages go to be read by a human later; it does
+not run code. Meanwhile:
+
+```
+orders        1001  PENDING
+inventory     p7    available=2  reserved=1
+reservations  R1    HELD, expires_at = t+15min
+```
+
+Nothing in the architecture is watching order 1001. The stock is held forever.
+
+**Two ways an order dies, and they need different mechanisms:**
+
+| Death | What the system knows | Who releases the stock |
+|---|---|---|
+| Card declined | Definitive answer, right now | The consumer itself, immediately |
+| Customer closes the laptop | **Nothing at all** — no error, no event | Only a periodic scan |
+
+Nobody publishes *"Sarah closed her laptop."* **The absence of an event is not an event**, which is
+also why the reaper can never be a queue consumer no matter how message-oriented the architecture is
+(§2, scheduled work).
+
+Both are needed, and asymmetrically so. The reaper *alone* is correct — the TTL eventually catches
+the declined card too. The immediate release alone is **not**, because it only covers failures that
+were anticipated. The reaper catches abandonment, a consumer that died after Stripe answered but
+before it could release, a message rotting in the DLQ, and next Tuesday's bug — **without needing to
+know why, because it isn't looking for causes, it's looking at a timestamp.** Same structure as
+`LISTEN/NOTIFY` + polling: the event path buys speed, the time path buys correctness, and you never
+get to drop the second one.
+
+#### The race, and why the reservation is the arbiter
+
+Reaper wakes at `t=15min`; Stripe — slow, not broken — approves at `t=15min+1ms`. Both sides CAS **the
+same row**:
+
+```sql
+-- reaper                                   -- payment consumer, after Stripe approves
+UPDATE reservations SET status='EXPIRED'    UPDATE reservations SET status='COMMITTED'
+ WHERE id=R1 AND status='HELD';              WHERE id=R1 AND status='HELD';
+```
+
+Nominating the reservation as sole arbiter is a *design decision*, not an accident: if the reaper
+CASed on `inventory` and the consumer on `orders`, they would never touch a common row and both
+would "win" — §5.11's point that a race is only decidable where the contenders have an address in
+common.
+
+The reaper's `WHERE status='HELD'` is also what stops a failure path from overwriting a success:
+once the consumer has moved the row to `COMMITTED`, the reaper gets rowcount 0 and does nothing.
+
+**When the consumer loses**, the money has already moved and cannot be un-moved. Order of recovery:
+
+1. Try to re-acquire — which is just Fix 2 again:
+   `UPDATE inventory SET available=available-1, reserved=reserved+1 WHERE product_id=$1 AND available >= 1`
+   rowcount 1 → proceed to `PAID`, customer never knows.
+2. rowcount 0 → genuinely sold out → **refund**.
+
+**The refund must be durable.** It is a network call; if the consumer dies before making it, the
+money is stranded untracked. So in the same transaction that discovers the loss, `INSERT` an outbox
+row for `refund_payment` — the outbox earning its keep on the unhappy path. Idempotency keyed on the
+payment id.
+
+**The window shrinks but never closes.** You charge, *then* CAS; in between, the money has moved and
+the row still says `HELD`. CASing `HELD → CHARGING` before calling Stripe (with the reaper skipping
+`CHARGING`) makes it rarer — but a dead consumer then strands a `CHARGING` row, which needs its own
+expiry, which is a lease, which has its own window. Infinite regress; same irreducible shape as mode
+C. Make it rare, don't claim it's gone.
+
+**TTL selection** is therefore a real decision: too short reaps legitimate slow payments and every
+occurrence is a support ticket; too long idles stock during exactly the flash sale where it matters.
+Payment timeout 30s + backoff to ~2min → **TTL 15min** is a ~7× margin. Ticketing sites run 5–10min
+and show a countdown, which is the honest UI for this trade.
+
+The reaper's own transaction is all DB-local — CAS the reservation, return the stock, fail the order,
+insert the notification outbox row — so it is ~2ms and must be **one transaction**. Split it and a
+crash mid-way leaks the stock, which is the bug being fixed. Batch with `SKIP LOCKED` so two reaper
+instances don't fight.
+
+#### G — deadlock, derived
+
+Sarah orders mouse→keyboard; Tom orders keyboard→mouse; both in stock, neither should fail.
+
+```
+t=0  Sarah  UPDATE product 7   🔒7
+t=1  Tom    UPDATE product 3   🔒3
+t=2  Sarah  UPDATE product 3   ⏳ waits for Tom
+t=3  Tom    UPDATE product 7   ⏳ waits for Sarah      → cycle
+```
+
+Postgres runs a deadlock detector: any transaction waiting longer than `deadlock_timeout` (default
+**1s**) triggers a scan of the wait-for graph; find a cycle, kill a victim with SQLSTATE `40P01`. So
+it never hangs — which is almost worse. Production symptom is an intermittent one-second stall and an
+error on a random one of the two orders, under load, never in testing.
+
+**Fix: a total, globally agreed acquisition order.** Sort line items by `product_id` ascending (and
+merge duplicate lines). The criterion is not speed — sorting three items is free — it is that the
+order is *total* and that *every* transaction uses the *same* one; two transactions sorting by
+different keys reintroduces the cycle. It works because a cycle requires some transaction to have
+gone backwards, so a total order makes cycles unconstructible. Dining philosophers, same fix.
+
+**But the convention leaks, and nothing can enforce it.** There is no constraint, trigger or setting
+that makes Postgres reject an unsorted access — the ordering is emergent from code the database never
+sees. Returns/restocks, the reaper, an ops engineer fixing something by hand at 3am: none go through
+your sorted path. So sorting is an *optimisation* on the path you control, and the actual safety net
+is **bounded, jittered retry on `40P01`**.
+
+**Why blind retry is safe here** — and this is the payoff. `40P01` is one of the very few errors that
+arrives with a guarantee attached: **the victim's transaction was fully rolled back.** No unknown
+state, nothing to reconcile. Contrast the Stripe timeout, which tells you nothing about whether the
+charge happened.
+
+**Which holds only if the transaction was pure database work.** A rollback undoes database
+operations; it cannot undo a charge, an email, or a cache write performed inside the transaction
+block — and that is true of raw SQL and ORMs alike, the line is *database vs. everything else*, not
+*SQL vs. ORM*. So the rule "never do network I/O inside a transaction", originally derived from lock
+hold time and pool exhaustion (§5.7), turns out to be the same rule that makes deadlock retry safe.
+**Two independent derivations of one rule** — usually the sign it is real rather than a heuristic.
+
+#### Tests these earn
+
+- Reserve, never pay, backdate `expires_at`, run reaper → stock restored, order `EXPIRED`,
+  `available + reserved` still equals physical stock.
+- **The F race:** fire reaper and payment-commit concurrently against R1 → exactly one wins; if the
+  reaper won, assert a refund outbox row exists.
+- Kill a consumer mid-job → message redelivered after the lease. *This is the test that would have
+  caught the `status='pending'` bug.*
+- **The G deadlock:** two multi-item orders with reversed line items, fired concurrently → both
+  succeed, zero `40P01` surfaced to the client.
+
 ---
 
 ## 6. Roadmap — remaining discussions
@@ -905,9 +1083,9 @@ at-least-once plus consumer-side dedupe — **effectively-once**.
 | # | Topic | Covers | Status |
 |---|---|---|---|
 | 1 | Node concurrency & 1000 orders | H, J | ✅ done (§5.2) |
-| 2 | Two orders, one item | A, F, G | ⚠️ A done (§5.10–5.11). **F and G handed over, not derived — owed** |
-| 2.5 | Invariants; the dual write; five patterns | B | ✅ done (§5.11, §5.12) |
-| **3** | **Payment & cancellation races** | **C, D, E, I** | **← after F and G** |
+| 2 | Two orders, one item | A, F, G | ✅ done (§5.10, §5.13) |
+| 2.5 | Invariants; the dual write; five patterns | B, E | ✅ done (§5.11, §5.12, §5.13) |
+| **3** | **Payment & cancellation races** | **C, D, I** | **← next** |
 | 4 | WebSockets / SSE — where real-time is standard vs cargo-cult | — | queued |
 | 5 | Redis — where caching helps vs. creates a consistency bug | — | queued |
 
