@@ -3,11 +3,12 @@
 > What every test asserts, how it is built, and — for the ones that matter — why
 > it is written the way it is rather than the obvious way.
 
-**81 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
+**113 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
 plus the rate limiter), and pure unit tests where no infrastructure is needed.
 
 | File | Tests | Covers | Needs |
 |---|---|---|---|
+| `tests/api_test.go` | 25 | Every REST endpoint: auth, CRUD, RBAC, validation | Postgres |
 | `tests/concurrency_test.go` | 7 | Overselling, deadlock ordering, idempotency (A, G) | Postgres |
 | `tests/saga_test.go` | 12 | Double charge, cancel-vs-charge, worker death (C, D, E) | Postgres |
 | `tests/notification_test.go` | 11 | Send-once, leases, retries (I) | Postgres |
@@ -87,7 +88,39 @@ goroutine has *reached* the barrier, so spawn cost does not stagger the release.
 
 ---
 
-## 2. Overselling and ordering — `concurrency_test.go`
+## 2. The REST API — `api_test.go`
+
+Every endpoint the brief specifies, table-driven where the cases are variations
+on one theme. Requests go through the engine with a recorder rather than a live
+socket: these are request/response, so there is nothing to stream.
+
+| Area | Asserts |
+|---|---|
+| Users | Creation, validation table (bad email, short password, missing name), duplicate email → 409, password hash never serialised |
+| Auth | Login success and both failure modes returning the **same** status, so login is not an account-enumeration oracle |
+| RBAC | Own profile vs someone else's (403), admin overrides, malformed tokens (401), unparseable path ids (400) |
+| Products | Full CRUD, admin-only writes, validation table, pagination with a **capped** page size |
+| Orders | 202 on create, validation table, list scoped to the caller, 404 (not 403) on someone else's order, cancel, `Idempotency-Key` header |
+| Admin | Every admin route refused for customers and anonymous callers; order status through the state machine; daily report; low stock; restock with optimistic locking |
+
+Three worth calling out:
+
+**`TestSelfRegistrationCannotMintAnAdmin`** — without the server-side role check,
+`"role":"ADMIN"` in a public signup body is a privilege escalation. The test
+registers with that field and then asserts the resulting token is refused by an
+admin route.
+
+**`TestAdminOrderStatusGoesThroughTheStateMachine`** — admins do not get a free
+hand with `orders.status`. `PENDING → FULFILLED` is refused because it is not an
+edge, and `PAID` is refused outright because marking an order paid by hand means
+money that was never taken.
+
+**`TestPriceChangesDoNotRewriteHistoricalOrders`** — places an order, changes the
+product price, and asserts the order still totals what it was placed at. That is
+`order_items.unit_price_cents` being a snapshot rather than a join, and it is the
+difference between an audit trail and a fiction.
+
+## 3. Overselling and ordering — `concurrency_test.go`
 
 Failure mode A: *two customers buy the last item, both succeed.*
 
@@ -132,7 +165,7 @@ the code above it is wrong.
 
 ---
 
-## 3. The payment saga — `saga_test.go`
+## 4. The payment saga — `saga_test.go`
 
 The hardest part of the system, and where node death actually hurts.
 
@@ -204,7 +237,7 @@ never paid for.
 
 ---
 
-## 4. The reaper — `reaper_test.go`
+## 5. The reaper — `reaper_test.go`
 
 Failure mode F: *a customer abandons checkout and holds the last unit forever.*
 
@@ -231,7 +264,7 @@ unconditional update.
 
 ---
 
-## 5. Notifications — `notification_test.go`
+## 6. Notifications — `notification_test.go`
 
 Failure mode I: *a notification is sent twice, or never.* Both halves need
 different mechanisms, so both are tested.
@@ -263,7 +296,7 @@ email and record that we sent it atomically. What these tests pin down is
 at-least-once with a very small duplicate window, which for notifications is the
 correct side to err on.
 
-## 6. The outbox relay — `relay_test.go`
+## 7. The outbox relay — `relay_test.go`
 
 Failure mode B, from the publishing side.
 
@@ -287,7 +320,7 @@ nothing was marked sent and the rows stay claimable.
 lets relays scale: the two instances' published counts must **sum** to the number
 of events, so no row was claimed twice.
 
-## 7. The daily report — `rollup_test.go`
+## 8. The daily report — `rollup_test.go`
 
 | Test | Asserts |
 |---|---|
@@ -309,7 +342,7 @@ would test the wrong thing — these tests are about the *report*.
 
 ---
 
-## 8. Real-time — `status_hub_test.go`, `sse_test.go`, `backplane_test.go`
+## 9. Real-time — `status_hub_test.go`, `sse_test.go`, `backplane_test.go`
 
 Three layers, tested separately because they fail differently.
 
@@ -345,7 +378,7 @@ The SSE route is authenticated but deliberately **outside** the rate limiter
 ([routes.go:143](../internal/api/routes/routes.go)) — a token bucket charges one
 token per request, and an SSE connection is one request held open for minutes, so
 a reconnecting client would be throttled for behaving correctly. The limiter is
-covered separately, in §8.4.
+covered separately, in §9.4.
 
 ### The topology (`backplane_test.go`, needs RabbitMQ)
 
@@ -355,7 +388,7 @@ covered separately, in §8.4.
 | `TestBackplaneQueuesDoNotCompete` | Two instances **both** receive the same event |
 | `TestBackplaneBindingScopesToOrderEvents` | `payment.*` does not leak onto the order stream |
 
-### 8.4 The rate limiter (`internal/api/middleware/ratelimit_test.go`, needs Redis)
+### 9.4 The rate limiter (`internal/api/middleware/ratelimit_test.go`, needs Redis)
 
 | Test | Asserts |
 |---|---|
@@ -379,7 +412,7 @@ fake client would execute the script in Go and test the opposite of what matters
 `TestRateLimiterFailsOpenWhenRedisIsUnreachable` asserts the behaviour claimed in
 SOLUTION.md directly — a cache outage must not become an API outage.
 
-### 8.5 Topology
+### 9.5 Topology
 
 `TestBackplaneQueuesDoNotCompete` guards the subtlest topology decision in the
 system. The `payments` queue has N consumers precisely so each message is handled
@@ -400,7 +433,7 @@ another and is never told.
 
 ---
 
-## 9. Running it
+## 10. Running it
 
 ```bash
 # With Go installed — testcontainers provides Postgres
@@ -429,9 +462,9 @@ concurrency tests against real Postgres say that.
 
 ---
 
-## 10. Coverage
+## 11. Coverage
 
-**54.8% of statements**, measured across `internal/` and `pkg/`:
+**71.6% of statements**, measured across `internal/` and `pkg/`:
 
 ```powershell
 .\scripts\go.ps1 test ./tests/... ./internal/services/... -count=1 `
@@ -451,23 +484,23 @@ go tool cover -func=coverage.out
 | Package | Coverage | Why |
 |---|---|---|
 | `internal/config` | 100.0% | Table-driven over pure functions |
+| `internal/api/middleware` | 95.3% | Auth via the HTTP tests, limiter directly |
+| `internal/api/routes` | 91.7% | Wiring, fully walked by the HTTP fixtures |
 | `internal/models` | 87.0% | State machine and envelope hit constantly |
-| `internal/api/routes` | 86.7% | Wiring, fully walked by the HTTP fixtures |
-| `internal/api/middleware` | 85.7% | Auth via the HTTP tests, limiter directly |
+| `internal/api/handlers` | 84.2% | Every endpoint, table-driven |
 | `pkg/database` | 75.0% | Error classification, exercised by every retry path |
+| `internal/repository` | 74.1% | Hot paths, outbox, notifications, leases, listings |
+| `internal/services` | 71.0% | Intake, saga, reaper, rollup, notifications, catalogue |
 | `pkg/logger` | 64.7% | |
-| `internal/repository` | 63.1% | Hot paths, outbox, notifications, leases |
-| `internal/services` | 56.6% | Intake, saga, reaper, rollup, notifications; catalogue CRUD not |
 | `internal/workers` | 37.5% | Relay and backplane covered; supervisor and consumers not |
-| `internal/api/handlers` | 23.6% | SSE covered; products, users and admin are not |
 
 *(Per-package figures are the mean of per-function percentages, so they are
-indicative rather than exact; the 54.8% total is statement-weighted.)*
+indicative rather than exact; the 71.6% total is statement-weighted.)*
 
-**Still below the >80% the brief asks for at `README.md:164`**, and worth stating
-plainly. The single largest remaining block is `internal/api/handlers` at 320
-statements — products, users and admin endpoints, which are exercised by hand and
-by `cmd/loadtest` but have no table-driven tests.
+**Approaching but not yet at the >80% the brief asks for at `README.md:164`.**
+The remaining gap is concentrated in `internal/workers` (37.5%) — the broker
+supervisor and the consumer loops, which need a controllable broker to test
+properly, and are tracked as the reconnect regression test below.
 
 What the number does *not* capture is that the coverage is deliberately
 concentrated on the parts that can lose money or corrupt data — the conditional
@@ -487,17 +520,16 @@ That said, the gap is real and closable. The cheapest wins, in order:
 3. **`internal/repository`** — targeted tests for the listing and admin queries
    that the hot paths never touch.
 
-## 11. What is not covered
+## 12. What is not covered
 
 - **The broker reconnect.** `workers.Supervise` is verified by hand
   (`docker compose restart rabbitmq`, watching both services redial with jittered
   backoff), but nothing in the suite guards it. Needs a broker whose connection
   can be severed on demand — toxiproxy, or a stoppable testcontainers RabbitMQ.
   **This is the most valuable remaining test.**
-- **HTTP handlers beyond SSE.** Products, users and admin endpoints are exercised
-  by hand and by `cmd/loadtest`, not by table-driven handler tests. At 320
-  statements this is the largest single block left, and the `sseFixture` pattern
-  already provides everything needed to write them.
+- **The broker supervisor and consumer loops** (`internal/workers`, 37.5%). Both
+  need a broker whose connection can be severed on demand; see the reconnect
+  regression test below.
 - **`cmd/*` entry points.** Wiring only, and the logic they wire is covered.
 - **The periodic loops themselves.** Every job is tested by calling its function
   directly — `ReapOnce`, `RecoverStuckCharges`, `SweepExpiredLeases`,
