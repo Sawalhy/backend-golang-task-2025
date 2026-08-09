@@ -143,21 +143,26 @@ func (r *Relay) drainOnce(ctx context.Context) (int, error) {
 	return published, nil
 }
 
-// ReportLag logs outbox depth and the age of the oldest unsent event.
+// ReportOutboxLag logs outbox depth and the age of the oldest unsent event.
 //
 // Count alone is ambiguous: 500 rows moving fast is healthy, three rows stuck
 // for ten minutes is an outage. Age is the signal that distinguishes them, and
-// it is the first thing to alert on.
-func (r *Relay) ReportLag(ctx context.Context) {
-	pending, err := r.store.Outbox().PendingCount(ctx)
+// it is the first thing to alert on — a rising oldest_age_seconds is exactly
+// what a wedged relay looks like from the outside.
+//
+// Deliberately not a method on Relay: it depends only on the database, so it
+// must keep reporting while the broker is down and the relay is between
+// sessions. That is precisely when you most want to see it.
+func ReportOutboxLag(ctx context.Context, store *repository.Store, log *slog.Logger) {
+	pending, err := store.Outbox().PendingCount(ctx)
 	if err != nil {
-		r.log.Error("reading outbox depth", "error", err)
+		log.Error("reading outbox depth", "error", err)
 		return
 	}
-	age, err := r.store.Outbox().OldestUnsentAge(ctx)
+	age, err := store.Outbox().OldestUnsentAge(ctx)
 	if err != nil {
-		r.log.Error("reading outbox lag", "error", err)
+		log.Error("reading outbox lag", "error", err)
 		return
 	}
-	r.log.Info("outbox lag", "pending", pending, "oldest_age_seconds", age.Seconds())
+	log.Info("outbox lag", "pending", pending, "oldest_age_seconds", age.Seconds())
 }

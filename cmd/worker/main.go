@@ -60,16 +60,6 @@ func run() error {
 	}
 	defer func() { _ = database.Close(db) }()
 
-	broker, err := workers.Connect(cfg.Rabbit.URL, cfg.Rabbit.Exchange, log)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = broker.Close() }()
-
-	if err := broker.DeclareTopology(); err != nil {
-		return err
-	}
-
 	store := repository.New(db, cfg.Order.DeadlockRetries)
 
 	provider := services.NewSimulatedProvider(
@@ -94,26 +84,37 @@ func run() error {
 	// are separate queues, not two consumers on one: sharing a queue would make
 	// them competing consumers, so an order.paid would reach one of them and the
 	// customer would get an email or a text, never both.
-
+	//
+	// All four live inside ONE supervised session. Channels belong to a
+	// Connection, so when the connection drops every consumer must be rebuilt —
+	// and a consumer parked on a delivery channel that will never deliver again
+	// is indistinguishable from an idle one. Supervise ends the session and
+	// redials; unacked messages are redelivered by the broker.
 	g.Go(func() error {
-		return workers.RunConsumer(gctx, broker, workers.QueuePayments,
-			cfg.Rabbit.Prefetch, cfg.Worker.Concurrency,
-			workers.PaymentHandler(payments.ProcessOrder), log)
-	})
+		return workers.Supervise(gctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, log,
+			func(sessionCtx context.Context, broker *workers.Broker) error {
+				cg, cctx := errgroup.WithContext(sessionCtx)
 
-	g.Go(func() error {
-		return workers.RunConsumer(gctx, broker, workers.QueueEmail,
-			cfg.Rabbit.Prefetch, cfg.Worker.Concurrency, email.Handle, log)
-	})
+				cg.Go(func() error {
+					return workers.RunConsumer(cctx, broker, workers.QueuePayments,
+						cfg.Rabbit.Prefetch, cfg.Worker.Concurrency,
+						workers.PaymentHandler(payments.ProcessOrder), log)
+				})
+				cg.Go(func() error {
+					return workers.RunConsumer(cctx, broker, workers.QueueEmail,
+						cfg.Rabbit.Prefetch, cfg.Worker.Concurrency, email.Handle, log)
+				})
+				cg.Go(func() error {
+					return workers.RunConsumer(cctx, broker, workers.QueueSMS,
+						cfg.Rabbit.Prefetch, cfg.Worker.Concurrency, sms.Handle, log)
+				})
+				cg.Go(func() error {
+					return workers.RunConsumer(cctx, broker, workers.QueueRefunds,
+						cfg.Rabbit.Prefetch, cfg.Worker.Concurrency, payments.HandleRefund, log)
+				})
 
-	g.Go(func() error {
-		return workers.RunConsumer(gctx, broker, workers.QueueSMS,
-			cfg.Rabbit.Prefetch, cfg.Worker.Concurrency, sms.Handle, log)
-	})
-
-	g.Go(func() error {
-		return workers.RunConsumer(gctx, broker, workers.QueueRefunds,
-			cfg.Rabbit.Prefetch, cfg.Worker.Concurrency, payments.HandleRefund, log)
+				return cg.Wait()
+			})
 	})
 
 	// --- periodic loops -----------------------------------------------------
@@ -141,6 +142,29 @@ func run() error {
 		return everyTick(gctx, cfg.Worker.NotifyLeaseTTL, func(ctx context.Context) {
 			if err := email.SweepExpiredLeases(ctx); err != nil {
 				log.Error("sweeping notification leases", "error", err)
+			}
+		})
+	})
+
+	// Materialises closed days into daily_sales_rollup.
+	//
+	// This is the other kind of time-triggered work: nothing happens at midnight
+	// to announce that a day has ended, so only a clock can notice. It resumes
+	// from the last materialised day, so a worker down for a week catches up on
+	// its first tick, and the upsert makes re-running a day harmless.
+	//
+	// Hourly rather than daily so a restart never has to wait until tomorrow to
+	// close yesterday — the work is idempotent, so the extra runs cost nothing.
+	reports := services.NewReportService(store, log)
+	g.Go(func() error {
+		// Run once at startup rather than waiting a full interval, so a fresh
+		// deployment has a populated rollup immediately.
+		if _, err := reports.RollupClosedDays(gctx, 30); err != nil {
+			log.Error("initial sales rollup failed", "error", err)
+		}
+		return everyTick(gctx, time.Hour, func(ctx context.Context) {
+			if _, err := reports.RollupClosedDays(ctx, 30); err != nil {
+				log.Error("sales rollup failed", "error", err)
 			}
 		})
 	})

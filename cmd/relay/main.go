@@ -53,34 +53,36 @@ func run() error {
 	}
 	defer func() { _ = database.Close(db) }()
 
-	broker, err := workers.Connect(cfg.Rabbit.URL, cfg.Rabbit.Exchange, log)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = broker.Close() }()
-
-	// Idempotent, so every process declaring on boot removes any startup
-	// ordering requirement between api, worker and relay.
-	if err := broker.DeclareTopology(); err != nil {
-		return err
-	}
-
-	pub, err := broker.NewPublisher()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = pub.Close() }()
-
 	store := repository.New(db, cfg.Order.DeadlockRetries)
-	relay := workers.NewRelay(store, pub, cfg.Worker.RelayInterval, cfg.Worker.RelayBatchSize, log)
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error { return relay.Run(gctx) })
+	// Supervise redials when the broker connection drops. A Connection and its
+	// Channels cannot be acquired once and reused forever: when RabbitMQ
+	// restarts, every later publish fails with "channel/connection is not open"
+	// and the relay stops delivering while still looking perfectly healthy.
+	//
+	// Everything the session owns is rebuilt inside this closure, because a
+	// Channel belongs to a Connection and cannot outlive it. Nothing is lost by
+	// the restart: unpublished rows still have sent_at IS NULL, so the next
+	// session claims exactly the same batch.
+	g.Go(func() error {
+		return workers.Supervise(gctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, log,
+			func(sessionCtx context.Context, broker *workers.Broker) error {
+				pub, err := broker.NewPublisher()
+				if err != nil {
+					return err
+				}
+				defer func() { _ = pub.Close() }()
 
-	// Lag reporting on its own schedule. Depth alone is ambiguous — 500 rows
-	// moving fast is healthy, three stuck for ten minutes is an outage — so the
-	// age of the oldest unsent row is reported alongside it.
+				relay := workers.NewRelay(store, pub, cfg.Worker.RelayInterval, cfg.Worker.RelayBatchSize, log)
+				return relay.Run(sessionCtx)
+			})
+	})
+
+	// Lag reporting runs against the DATABASE, on the parent context, so it keeps
+	// reporting while the broker is down and the relay is between sessions —
+	// which is exactly when a growing backlog matters most.
 	g.Go(func() error {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -89,7 +91,7 @@ func run() error {
 			case <-gctx.Done():
 				return nil
 			case <-ticker.C:
-				relay.ReportLag(gctx)
+				workers.ReportOutboxLag(gctx, store, log)
 			}
 		}
 	})

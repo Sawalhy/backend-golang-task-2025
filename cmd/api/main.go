@@ -16,16 +16,34 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/api/routes"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/config"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/repository"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/services"
+	"github.com/Sawalhy/backend-golang-task-2025/internal/workers"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/database"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/logger"
 )
 
+//	@title			Concurrent Order Processing API
+//	@version		1.0
+//	@description	Order processing with reserve-pay-commit inventory, an outbox
+//	@description	relay, and compare-and-swap state transitions throughout.
+//	@description
+//	@description	POST /orders returns 202, not 201: when it returns, stock is
+//	@description	reserved and the order exists, but payment has not happened yet.
+//	@description	Poll GET /orders/{id}/status for the outcome.
+//
+//	@host		localhost:8080
+//	@BasePath	/api/v1
+//
+//	@securityDefinitions.apikey	BearerAuth
+//	@in							header
+//	@name						Authorization
+//	@description				Paste the token from POST /auth/login as: Bearer <token>
 func main() {
 	// The runtime image is distroless: no shell, no curl, no wget. A container
 	// healthcheck therefore has to be the binary itself, probing over HTTP and
@@ -107,12 +125,22 @@ func run() error {
 
 	store := repository.New(db, cfg.Order.DeadlockRetries)
 
+	// The hub holds this instance's SSE connections. It is per-instance by
+	// design: each API replica gets its own exclusive queue bound to order.#, so
+	// all of them see every event and each pushes to whichever clients it
+	// happens to hold. No sticky sessions, no shared state between replicas.
+	hub := services.NewStatusHub()
+	instanceID := uuid.NewString()
+
+
 	engine := routes.Build(routes.Deps{
 		Cfg:     cfg,
 		Log:     log,
 		Auth:    services.NewAuthService(store, cfg.Auth),
 		Orders:  services.NewOrderService(store, cfg.Order, log),
 		Catalog: services.NewCatalogService(store),
+		Reports: services.NewReportService(store, log),
+		Hub:     hub,
 		Redis:   rdb,
 		Health: func() error {
 			pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -145,6 +173,19 @@ func run() error {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
+	}()
+
+	// Feed the hub from the broker, redialling whenever the connection drops.
+	//
+	// RabbitMQ being unreachable must not stop the API booting — it backs SSE
+	// only, and every other route is unaffected — so Supervise retries in the
+	// background instead of failing startup. It also exits when ctx is
+	// cancelled, giving the goroutine a guaranteed exit path.
+	go func() {
+		_ = workers.Supervise(ctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, log,
+			func(sessionCtx context.Context, broker *workers.Broker) error {
+				return workers.RunOrderEventBackplane(sessionCtx, broker, instanceID, hub.Publish, log)
+			})
 	}()
 
 	select {
