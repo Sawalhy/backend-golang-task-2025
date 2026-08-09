@@ -484,23 +484,24 @@ go tool cover -func=coverage.out
 | Package | Coverage | Why |
 |---|---|---|
 | `internal/config` | 100.0% | Table-driven over pure functions |
+| `internal/models` | 100.0% | State machine, reachability, enum round-trips |
+| `pkg/logger` | 100.0% | Trace id propagation |
 | `internal/api/middleware` | 95.3% | Auth via the HTTP tests, limiter directly |
 | `internal/api/routes` | 91.7% | Wiring, fully walked by the HTTP fixtures |
-| `internal/models` | 87.0% | State machine and envelope hit constantly |
+| `pkg/database` | 91.7% | Error classification through wrapped errors |
+| `internal/services` | 88.0% | Intake, saga, refunds, reaper, rollup, notifications, provider |
 | `internal/api/handlers` | 84.2% | Every endpoint, table-driven |
-| `pkg/database` | 75.0% | Error classification, exercised by every retry path |
-| `internal/repository` | 74.1% | Hot paths, outbox, notifications, leases, listings |
-| `internal/services` | 71.0% | Intake, saga, reaper, rollup, notifications, catalogue |
-| `pkg/logger` | 64.7% | |
-| `internal/workers` | 37.5% | Relay and backplane covered; supervisor and consumers not |
+| `internal/repository` | 80.7% | Hot paths, outbox, notifications, leases, listings |
+| **`internal/workers`** | **37.5%** | **The only package below 80% — see §12.1** |
 
 *(Per-package figures are the mean of per-function percentages, so they are
-indicative rather than exact; the 71.6% total is statement-weighted.)*
+indicative rather than exact; the 77.1% total is statement-weighted.)*
 
-**Approaching but not yet at the >80% the brief asks for at `README.md:164`.**
-The remaining gap is concentrated in `internal/workers` (37.5%) — the broker
-supervisor and the consumer loops, which need a controllable broker to test
-properly, and are tracked as the reconnect regression test below.
+**Just short of the >80% the brief asks for at `README.md:164`**, and the shortfall
+is now concentrated in exactly one place. Every other package is at or above the
+bar; `internal/workers` sits at 37.5% because its untested half is the broker
+supervisor and the consumer loops, which cannot be reached without a connection
+that can be severed on demand. That is the next section.
 
 What the number does *not* capture is that the coverage is deliberately
 concentrated on the parts that can lose money or corrupt data — the conditional
@@ -520,7 +521,149 @@ That said, the gap is real and closable. The cheapest wins, in order:
 3. **`internal/repository`** — targeted tests for the listing and admin queries
    that the hot paths never touch.
 
-## 12. What is not covered
+## 12. What is not covered, and why
+
+Every remaining gap falls into one of four buckets. They are listed with what it
+would actually take to close them, because "untested" without a reason is just an
+apology.
+
+### 12.1 Needs a severable broker connection — the SIGKILL bucket
+
+**`internal/workers/supervisor.go` — 45 statements, 0% covered.** The single
+largest untested unit, and the only one that genuinely resists ordinary testing.
+
+This is the code that fixed the worst bug in the project: an AMQP connection was
+acquired once at startup and never redialled, so after RabbitMQ dropped it the
+relay failed **241 consecutive publishes** while its health check stayed green
+and the entire async pipeline silently stopped.
+
+Testing it requires making a live connection die *underneath* a running session —
+not closing it politely, which is a different code path. Options:
+
+| Approach | Cost |
+|---|---|
+| **toxiproxy** between the app and RabbitMQ | Best fidelity. Adds a container and a control API; can sever mid-publish on demand |
+| **testcontainers RabbitMQ**, stopped mid-session | No extra dependency, but stop/start is slow and the timing is coarse |
+| **Management API**, force-close the connection | Light, but it closes politely-ish and may not reproduce a hard drop |
+| **A real `SIGKILL`** of a worker subprocess | Tests the whole thing end to end, including redelivery |
+
+The `SIGKILL` variant is the most valuable and the most awkward, and it is worth
+being precise about *why* it is awkward, because it is not the killing:
+
+- **Determinism.** The process must be killed at a specific moment — after the
+  `PENDING → CHARGING` CAS, before settlement. `PAYMENT_LATENCY` is already
+  configurable, so setting it to 30s gives a wide, reliable window. That part is
+  easy.
+- **Process lifecycle.** The test must build the binary, start it with the right
+  environment, wait for readiness (poll the database until the order reaches
+  `CHARGING`), kill it, and capture its stderr so a failure is diagnosable rather
+  than mysterious.
+- **Speed and flakiness.** Seconds, not milliseconds, and it depends on process
+  scheduling. It belongs behind a build tag or `-short` guard so it does not run
+  on every save.
+
+What it would prove that nothing currently does: **that RabbitMQ actually
+redelivers the unacked message** when a consumer's connection dies, and that the
+*real binary's* wiring recovers. Today both are argued from the code rather than
+demonstrated. `killWorkerMidCharge` reproduces the database state a dead worker
+leaves behind — which is enough to test the recovery logic, and is deliberately
+kept for being fast and deterministic — but it cannot prove the broker half.
+
+### 12.2 Needs a live consumer, but nothing killed
+
+**`internal/workers/consumer.go` (34 statements), `broker.go` `Consume`,
+`relay.go` `Run`.** These need a broker and a running loop, but no failure
+injection: publish a message, let the consumer handle it, assert the ack.
+
+The interesting cases are the ack/nack policy — a handler error nacks with
+requeue on first delivery and dead-letters on the second, so a poison message
+cannot loop forever. That is testable today with the existing RabbitMQ; it simply
+has not been written. Roughly a day, and it would take `internal/workers` from
+37.5% to most of the way.
+
+### 12.3 Error branches — needs fault injection
+
+**~250 statements**, spread thinly across every file as
+`if err != nil { return err }`. These fire only when the database itself fails
+mid-transaction: a dropped connection, a full disk, a cancelled context at an
+awkward moment.
+
+Reaching them needs a proxy that can fail queries on command, or interface seams
+introduced purely so a mock can return errors — which would mean mocking the
+database, the one thing this suite deliberately refuses to do.
+
+**This is the bucket I would leave alone.** The branches are one line each and
+uniform; the risk they carry is low, and the machinery to reach them would cost
+more clarity than it buys confidence. Coverage percentage is the wrong reason to
+add it.
+
+### 12.4 Not worth testing
+
+- **`cmd/*` entry points.** Wiring only. The logic they wire is covered, and a
+  test would assert that the code is shaped the way it is shaped.
+- **The periodic loops themselves.** Every job is tested by calling its function
+  directly — `ReapOnce`, `RecoverStuckCharges`, `SweepExpiredLeases`,
+  `RollupClosedDays`, `DrainOnce`. What is *not* tested is `everyTick` firing on
+  its configured interval, which would mean a test that mostly waits. The
+  scheduling is four lines and reviewable by eye.
+
+### Summary
+
+| Bucket | Statements | Verdict |
+|---|---|---|
+| Broker supervisor (severable connection / SIGKILL) | ~45 | **Worth doing** — guards the worst bug found |
+| Consumer loops (live broker) | ~60 | **Worth doing** — ordinary integration work |
+| Error branches (fault injection) | ~250 | **Leave** — cost exceeds benefit |
+| Entry points and scheduling | ~30 | **Leave** — wiring |
+
+Closing the first two would put coverage in the mid-eighties. Closing the third
+would push it higher and make the suite worse.
+
+## 13. The refund consumer — `refund_test.go`
+
+Worth its own section because it was the most consequential gap in the suite, and
+it had nothing to do with infrastructure.
+
+The saga tests prove a refund is **requested**: the order reaches
+`CANCELLED_REFUNDED` and a `payment.refund_requested` event lands in the outbox.
+Nothing proved it was ever **executed**. That is the compensating action of the
+entire cancel-vs-charge design, and it is the one path where a bug costs real
+money in the direction nobody complains about — paying a customer back twice.
+
+| Test | Asserts |
+|---|---|
+| `TestRefundIsExecutedAgainstTheProvider` | The provider is actually called; payment → `REFUNDED`; completion announced |
+| `TestDuplicateRefundEventsRefundOnce` | Four deliveries, **one** refund |
+| `TestRefundSkipsPaymentsThatNeverSucceeded` | A declined charge is never refunded — that would be inventing a payout |
+| `TestRefundWithoutAProviderReferenceEscalates` | A `SUCCEEDED` payment with no reference errors rather than guessing at the card network, and stays refundable |
+| `TestRefundFailureLeavesThePaymentRefundable` | A refused refund is not recorded as done |
+| `TestRefundRejectsMalformedEvents` | Missing, empty, malformed and wrong-typed `paymentId` |
+| `TestRefundForAnUnknownPaymentErrors` | A stale replay surfaces rather than being swallowed |
+| `TestCancelDuringChargeLeadsToAnExecutedRefund` | End to end: cancel races the charge, charge wins, refund actually returns the money — charged once, refunded once, stock back |
+
+The last one is the full compensation loop, which previously stopped at the
+outbox row.
+
+## 14. Recently closed
+
+Context on what moved, and why the number is not the point:
+
+| Was | Now | What it took |
+|---|---|---|
+| `internal/api/handlers` 23.6% | 84.2% | Table-driven tests over every endpoint |
+| `internal/services` 51.6% | 88.0% | Refund consumer, simulated provider, notifications |
+| `internal/repository` 48.6% | 80.7% | Listing and admin queries, audit, live-intent lookup |
+| `internal/config` 14.3% | 100% | Pure functions, table-driven |
+| `internal/models` 87.0% | 100% | State machine reachability, enum round-trips |
+| `pkg/logger` 58.0% | 100% | Trace id propagation |
+| `pkg/database` 75.0% | 91.7% | Error classification through wrapped errors |
+| **total 44.8%** | **77.1%** | |
+
+Several of those found real defects rather than moving a percentage: the
+worker-death recovery gap, the reconciliation CAS that abandoned half its work,
+and the backplane tests that were passing vacuously. The refund consumer was the
+largest correctness gap of the lot and needed no infrastructure at all — it had
+simply never been written.
 
 - **The broker reconnect.** `workers.Supervise` is verified by hand
   (`docker compose restart rabbitmq`, watching both services redial with jittered
