@@ -17,12 +17,9 @@
 > distributed systems rather than about a runtime. See `docs/IMPLEMENTATION.md` for the Go-facing
 > digest.
 
-> **Status: DESIGN IN PROGRESS.** Nothing is being built. Working through failure modes
-> pedagogically before locking architecture. Three structural decisions remain open.
->
-> **Companion file:** `design-dialogue-transcript.md` — the chronological back-and-forth, with
-> Ahmed's questions verbatim and the corrections made along the way. This file organizes
-> conclusions by topic; that one preserves the order they were reached in.
+> **Status: DESIGN COMPLETE.** All ten failure modes and all ten discussion topics are closed.
+> Nothing is built yet. Remaining open items are in §3; the build order is in
+> `IMPLEMENTATION.md` §8.
 >
 > Citations of the form `README.md:212` refer to the assignment brief at the repository root
 > (`../README.md`), by line number.
