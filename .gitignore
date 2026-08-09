@@ -10,3 +10,6 @@
 *.test
 coverage.out
 coverage.html
+
+# Local run logs
+*.log
