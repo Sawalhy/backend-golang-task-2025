@@ -182,8 +182,10 @@ CREATE UNIQUE INDEX ON notifications (order_id, channel, kind);   -- send-once
 
 `POST /orders` returns **202 Accepted**. When it returns, the stock is reserved
 and the order exists; the payment has *not* happened. 201 Created would imply a
-completed resource and invite clients to treat the order as paid. Clients poll
-`GET /orders/{id}/status`.
+completed resource and invite clients to treat the order as paid.
+
+Clients learn the outcome either by polling `GET /orders/{id}/status` or by
+subscribing to `GET /orders/{id}/events` (SSE) — see below.
 
 ## Concurrency inventory
 
@@ -202,28 +204,254 @@ completed resource and invite clients to treat the order as paid. Clients poll
 cycle impossible. Every path that settles reservations reads them back in the
 same order.
 
+## API documentation
+
+Swagger UI is at **`http://localhost:8080/swagger/index.html`** (or `/docs`),
+served in development only — in production it publishes a complete map of every
+route, field and validation rule to anyone who asks. The raw spec lives at
+`docs/swagger/swagger.json`.
+
+Regenerate after changing any annotation:
+
+```bash
+go run github.com/swaggo/swag/cmd/swag@latest init -g cmd/api/main.go -o docs/swagger --parseDependency --parseInternal
+```
+
+## Load testing
+
+`cmd/loadtest` drives concurrent orders and reports latency percentiles,
+throughput and the outcome mix.
+
+```bash
+go run ./cmd/loadtest -n 1000 -c 200 -product 2 -settle 10s
+go run ./cmd/loadtest -n 500 -c 500 -product 5 -mode burst   # oversell check
+```
+
+Through the containerised toolchain, target the service name — `scripts/go.ps1`
+joins the compose network:
+
+```bash
+.\scripts\go.ps1 run ./cmd/loadtest -url http://api:8080 -n 1000 -c 200 -product 2
+```
+
+**Raise `RATE_LIMIT_RPS` before measuring**, or the token bucket becomes the
+bottleneck and every number describes the limiter rather than the pipeline.
+
+`-mode burst` blocks every goroutine on one channel and releases them together.
+That distinction matters: requests trickled out never collide, so a load test
+without a barrier proves nothing about contention.
+
+The point is not a single throughput number — it is **varying one thing at a
+time** and seeing what moves.
+
+### Measured: the pool is the bottleneck
+
+1000 orders, 200 concurrent, everything else held constant. The only change
+between runs is `DB_MAX_OPEN_CONNS`:
+
+| | pool 12 | pool 40 | change |
+|---|---|---|---|
+| throughput | 39 req/s | **147 req/s** | **3.8×** |
+| wall clock | 25.8s | 6.8s | 3.8× faster |
+| p50 | 3.304s | **1.061s** | 3.1× |
+| p95 | 14.064s | 2.999s | 4.7× |
+| p99 | 20.157s | **4.710s** | 4.3× |
+| accepted | 1000/1000 | 1000/1000 | — |
+
+Both runs accepted every order with zero transport errors, so this is pure
+queueing, not failure. At 200 concurrent requests against 12 connections, ~188 of
+them are waiting on the pool rather than on Postgres — which is what a p50 of 3.3s
+against a p50 of 1.0s is measuring.
+
+**Do not read this as "bigger pools are better."** It says the pool was *this*
+system's constraint at *this* concurrency. Past the point where connections
+exceed what the database's cores can serve, added connections contend rather than
+help and throughput falls — which is why the default stays conservative and why
+`replicas × poolSize` is the number that matters on Kubernetes.
+
+Settlement after the pool-12 run: 48 `PAID`, 2 `FAILED` from a sample of 50 —
+the simulated provider's decline rate showing up end to end.
+
+Still worth running, same method:
+
+| Change | Expected | What it would prove |
+|---|---|---|
+| `PAYMENT_LATENCY` 200ms → 2s | ~none on intake | payment is off the request path — what reserve→pay→commit buys |
+| `--scale worker=1 → 4` | moves settlement only | intake and processing are genuinely decoupled |
+
+`-settle` re-reads a sample of accepted orders after the pipeline drains,
+because **202 throughput and end-to-end completion are different numbers** and
+reporting the first as if it were the second is how an async system gets claimed
+as faster than it is.
+
+## Daily sales report, and the rollup
+
+`GET /admin/reports/daily` is served from **two sources**, and each row says
+which one it came from:
+
+| Source | Days | Why |
+|---|---|---|
+| `rollup` | closed days | Yesterday's total can never change — those orders are terminal. Compute it once, store it. |
+| `live` | today | Still moving. Materialising it would be a cache, and caches need invalidation. |
+
+`daily_sales_rollup` was **not** required by the spec — `README.md:54` mandates
+eight entities and this is not one of them. It comes from `DESIGN_NOTES.md`
+§5.17, where the argument is that the immutable half of a report wants
+materialising rather than caching. It is one of three tables the design adds
+beyond the brief, alongside `reservations` and `outbox`.
+
+Three properties make it safe to run on a timer:
+
+- **Idempotent.** `ON CONFLICT DO UPDATE` overwrites, so re-running a day
+  produces the same row. The scheduler re-runs days after a restart, and a
+  rollup that accumulated on replay would silently double revenue.
+- **Resumes.** It starts from the last materialised day, so a worker down for a
+  week catches up in a few statements instead of recomputing all history.
+- **Degrades to slow, never to wrong.** Any closed day the job has not reached
+  falls through to live aggregation, so a lagging rollup costs time, not
+  accuracy.
+
+Only `PAID` and `FULFILLED` count as revenue. Counting a `PENDING` or `EXPIRED`
+order would overstate takings, which is the most consequential kind of bug a
+sales report can have — and it is the first thing the tests check.
+
+Like the reaper, the rollup is a **timer, not a consumer**: nothing happens at
+midnight to announce that a day ended, so only a clock can notice.
+
+## Real-time order status (SSE)
+
+```
+GET /api/v1/orders/{id}/events     # text/event-stream
+```
+
+SSE rather than WebSocket: the client never sends anything on this channel, so a
+bidirectional protocol solves a problem that does not exist. SSE is plain HTTP —
+it survives proxies, needs no upgrade handshake, and browsers reconnect on their
+own.
+
+**How an event reaches a browser.** The relay publishes to the `orders` exchange
+as usual. Each API instance declares its own **exclusive, auto-delete** queue
+`sse.<instance-id>` bound to `order.#`, so every instance receives every event
+and pushes to whichever connections it happens to be holding. No sticky
+sessions, no shared state between replicas, no coordination.
+
+That the per-instance queues do **not** compete is the whole trick. `payments`
+has N consumers precisely so each message is handled *once*; here every instance
+must receive *every* event, because any of them might hold the connection that
+cares. Same exchange, same messages — different topology.
+
+**Two details that are easy to get wrong:**
+
+- **Subscribe before reading current state.** The handler registers with the hub
+  *first*, then reads the order and emits it. Reading first leaves a window in
+  which a transition fires with nobody listening, and the client sits on a stale
+  status forever. Subscribing first can only produce a duplicate.
+- **Publishing never blocks.** The hub sends non-blocking into buffered channels
+  and drops on overflow, because `Publish` runs on the backplane consumer's
+  goroutine — one stalled browser must not stop delivery for everyone else on
+  the instance. Dropping is safe because events are doorbells: the handler
+  re-reads authoritative state from Postgres on every one it does receive.
+
+Streams close when the order reaches a terminal state, rather than holding a
+connection open for an event that can never arrive.
+
+**Inventory is still not pushed** — that half of `README.md:110-114` is
+deliberately not built, and the reasoning is in "What is not built".
+
+## Testing
+
+With Go installed locally:
+
+```bash
+go test ./... -race        # testcontainers starts a throwaway Postgres
+```
+
+Through the containerised toolchain, point the tests at a database rather than
+letting testcontainers start one — `scripts/go.ps1` does not mount the Docker
+socket, so the container cannot launch sibling containers:
+
+```powershell
+docker compose exec postgres createdb -U postgres orders_test
+$env:TEST_DATABASE_URL = "postgres://postgres:postgres@postgres:5432/orders_test?sslmode=disable"
+.\scripts\go.ps1 test ./... -count=1
+.\scripts\go.ps1 test ./internal/services/... -race    # hub concurrency, no DB needed
+```
+
+Use a **separate database**: the suite truncates every table between tests, so
+pointing it at `orders` would wipe the running stack.
+
+Integration tests run the real migration files, not `AutoMigrate`, because the
+CHECK constraints and partial unique indexes *are* the invariants under test.
+
+Current state: **18 passing** — 7 rollup, 4 SSE, 7 hub (the hub set clean under
+`-race`).
+
+**Nothing mocks the database, on purpose.** A mock returns what you told it to,
+so it is structurally incapable of exhibiting a race — it cannot lose an update,
+deadlock, or enforce a constraint. Every interesting bug in this system is a
+database race, so a mock-based suite would pass while the system oversold stock.
+
 ## What is not built
 
 Stated plainly, because silence reads as unfinished.
 
-- **Concurrency test suite (Testcontainers)** — the highest-value remaining item.
-  The design calls for N goroutines released simultaneously against real
-  Postgres, asserting exactly one success on a single-unit product. Not yet
-  written.
-- **Swagger UI** — handlers carry `@Summary`/`@Router` annotations ready for
-  `swag init`; the generated spec and served endpoint are not wired up.
-- **SSE order status** — the transport decision is made (SSE over WebSocket: the
-  client never sends, and `Last-Event-ID` reconnection comes free) but the
-  endpoint and backplane are not implemented.
-- **Load test and benchmarks** — the plan is to vary one thing at a time (pool
-  size, lock hold time, process count) to demonstrate which is actually the
-  bottleneck.
-- **`daily_sales_rollup`** — the table exists; the report currently aggregates
-  live rather than reading the rollup.
+- **Oversell regression test** — the guarantee is currently demonstrated by
+  `cmd/loadtest -mode burst` and verified by hand, not by a test in the suite.
+  The harness in `tests/` now exists, so this is a short job and the next thing
+  worth doing.
+- **Real-time inventory push** — order status streams; stock levels do not.
+  Broadcasting every decrement to every browsing customer is a firehose that
+  serves almost nobody, and the number is stale the instant it is rendered
+  anyway. The conditional `UPDATE` at order time is what actually decides who
+  gets the last unit, which is why the API never invites "check stock, then
+  order" as two steps.
 - **Bonus items** — Prometheus, tracing, Kubernetes manifests, WebSocket.
 - **No WebSockets, and no push for inventory.** Deliberate: a bidirectional
   protocol solves a problem order status does not have. This forfeits a bonus
   tick; the justification is worth more.
+
+## A bug that only running it would find
+
+Worth reading, because it is the one defect here that no unit test would have
+caught and every design review would have missed.
+
+An AMQP `Connection` and its `Channel`s were acquired **once at startup**.
+amqp091-go does not reconnect. When RabbitMQ dropped the connection under load,
+every subsequent publish returned:
+
+```
+Exception (504) Reason: "channel/connection is not open"
+```
+
+...and kept returning it. The relay stayed alive, its process-level health check
+stayed green, and it never published another event — 241 identical failures in a
+row before it was noticed. The outbox grew without bound and **the entire async
+pipeline silently stopped**: no payments, no notifications, no order ever leaving
+`PENDING`.
+
+The failure mode is nastier than a crash. A crashed relay restarts and recovers;
+a wedged one looks healthy forever.
+
+The fix is conceptual rather than mechanical: **a broker connection is a session
+that ends, not a resource acquired once.** `workers.Supervise` owns the lifecycle
+— it dials, runs the session, and redials with capped jittered backoff when the
+session ends. Everything the session owns (channels, publishers, consumers, queue
+declarations) is rebuilt on reconnect, because a Channel belongs to a Connection
+and cannot outlive it. A `NotifyClose` watcher turns a silently dead connection
+into a session that ends, which matters most for consumers: one parked on a
+delivery channel that will never deliver again is indistinguishable from an idle
+one.
+
+Nothing is lost across a reconnect, and that is the outbox earning its keep:
+unpublished rows still have `sent_at IS NULL`, so the next session claims exactly
+the same batch. Unacked deliveries are redelivered by the broker.
+
+Two details worth defending: the backoff is **jittered**, or every service
+reconnects in lockstep the moment the broker returns and knocks it straight over
+again; and outbox lag reporting runs on the **database** connection, not the
+broker session, so it keeps reporting while the broker is down — precisely when a
+growing backlog matters most. A rising `oldest_age_seconds` is what this bug
+looks like from the outside, and it is the thing to alert on.
 
 ## Operational notes
 
