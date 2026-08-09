@@ -3,7 +3,7 @@
 > What every test asserts, how it is built, and — for the ones that matter — why
 > it is written the way it is rather than the obvious way.
 
-**113 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
+**167 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
 plus the rate limiter), and pure unit tests where no infrastructure is needed.
 
 | File | Tests | Covers | Needs |
@@ -17,9 +17,17 @@ plus the rate limiter), and pure unit tests where no infrastructure is needed.
 | `tests/relay_test.go` | 6 | Confirm-before-`sent_at`, no double publish (B) | Postgres + RabbitMQ |
 | `tests/sse_test.go` | 4 | Order status streaming over HTTP | Postgres |
 | `tests/backplane_test.go` | 3 | RabbitMQ → hub delivery topology | RabbitMQ |
+| `tests/consumer_test.go` | 8 | Delivery, ack/nack policy, bounded pool | RabbitMQ |
+| `tests/supervisor_test.go` | 4 | Reconnect after connection loss | RabbitMQ + mgmt API |
+| `tests/refund_test.go` | 8 | Refund execution and compensation | Postgres |
 | `internal/api/middleware/ratelimit_test.go` | 7 | Token bucket atomicity, fail-open | Redis |
 | `internal/config/config_test.go` | 10 | Env parsing, validation, boot refusal | — |
 | `internal/services/status_hub_test.go` | 7 | SSE fan-out, no leaks, non-blocking publish | — |
+| `internal/services/payment_provider_test.go` | 11 | Simulated provider idempotency, outcomes | — |
+| `internal/models/models_test.go` | 9 | State machine, reachability, enum round-trips | — |
+| `pkg/database/database_test.go` | 4 | Error classification through wrapping | — |
+| `pkg/logger/logger_test.go` | 5 | Trace id propagation | — |
+| `tests/repository_test.go` | 5 | Live-intent lookup, audit atomicity | Postgres |
 
 ---
 
@@ -433,6 +441,67 @@ another and is never told.
 
 ---
 
+### 9.6 The consumer machinery (`consumer_test.go`, needs RabbitMQ)
+
+A live broker, but nothing killed: publish, let the consumer handle it, observe
+the acknowledgement. Each test gets a **scratch queue** bound to a unique routing
+key, declared with a raw connection — production code has no business growing a
+"make me a test queue" method.
+
+| Test | Asserts |
+|---|---|
+| `TestConsumerDeliversEventsToTheHandler` | The round trip reaches the handler intact |
+| `TestSuccessfulHandlingAcksTheMessage` | Handled once and **not redelivered** |
+| `TestFailingHandlerRetriesOnceThenDeadLetters` | Exactly two attempts, then it stops |
+| `TestUnparseableMessagesAreDiscardedImmediately` | Garbage never reaches the handler, and does not wedge the consumer for good messages |
+| `TestConcurrencyIsBounded` | Ten messages, limit 2 → peak in-flight never exceeds 2 |
+| `TestCancellationWaitsForInFlightWork` | A handler mid-flight when shutdown arrives **completes** |
+| `TestPaymentHandlerRequiresAnOrderID` | An event with no aggregate id is refused rather than charging order zero |
+| `TestRelayRunDrainsOnItsTicker` | The relay loop picks up work unprompted, and stops on cancellation |
+
+`TestFailingHandlerRetriesOnceThenDeadLetters` is the one worth reading. A
+handler error nacks with requeue on first delivery and *without* on redelivery,
+so a poison message cannot loop forever — the `Redelivered` flag bounds it
+without a counter. The test asserts the count stops at two rather than climbing,
+which is the difference between a retry and an infinite loop that looks like a
+busy worker.
+
+Every test's cleanup asserts the consumer goroutine actually **exits** after
+cancellation. A goroutine with no exit path is a leak, and one blocked on a
+delivery channel that will never deliver again is indistinguishable from an idle
+one.
+
+### 9.7 Broker reconnection (`supervisor_test.go`, needs RabbitMQ + management API)
+
+The regression tests for the worst bug in the project: a connection acquired once
+at startup and never redialled, so after RabbitMQ dropped it the relay failed
+**241 consecutive publishes** while its health check stayed green.
+
+Reproducing that needs a connection that dies *underneath* a running session.
+These tests use **RabbitMQ's management API to force-close the connection from
+the broker side** — the same thing the broker does to every client when it
+restarts, and both faster and more deterministic than killing a process.
+
+Connections are dialled with a `connection_name`, which is what makes a specific
+one findable and killable. That naming is not test scaffolding: without it the
+management UI lists connections by `host:port`, so during an incident you cannot
+tell the relay from a worker from an API replica.
+
+| Test | Asserts |
+|---|---|
+| `TestSupervisorRedialsAfterTheConnectionIsKilled` | The session ends and a **new one starts**, without the process restarting |
+| `TestRelayKeepsDrainingAcrossAConnectionLoss` | Events enqueued *after* the kill still reach the broker |
+| `TestEventsEnqueuedWhileDisconnectedArePublishedOnRecovery` | Rows written *during* the outage are published on reconnect |
+| `TestSupervisorRetriesAnUnreachableBrokerAndStopsCleanly` | An unreachable broker is retried, not fatal, and cancellation returns cleanly |
+
+The second and third are the ones that matter. Redialling is not the point —
+**work resuming** is. Against the original bug the second test fails exactly the
+way production did: the relay stays alive and never publishes again.
+
+The third is the outbox earning its keep. Nothing is lost across a reconnect
+because unpublished rows still have `sent_at IS NULL`, so the next session claims
+the same batch.
+
 ## 10. Running it
 
 ```bash
@@ -491,17 +560,23 @@ go tool cover -func=coverage.out
 | `pkg/database` | 91.7% | Error classification through wrapped errors |
 | `internal/services` | 88.0% | Intake, saga, refunds, reaper, rollup, notifications, provider |
 | `internal/api/handlers` | 84.2% | Every endpoint, table-driven |
+| `internal/workers` | 82.7% | Relay, backplane, consumers, supervisor |
 | `internal/repository` | 80.7% | Hot paths, outbox, notifications, leases, listings |
-| **`internal/workers`** | **37.5%** | **The only package below 80% — see §12.1** |
 
 *(Per-package figures are the mean of per-function percentages, so they are
-indicative rather than exact; the 77.1% total is statement-weighted.)*
+indicative rather than exact; the 82.1% total is statement-weighted.)*
 
-**Just short of the >80% the brief asks for at `README.md:164`**, and the shortfall
-is now concentrated in exactly one place. Every other package is at or above the
-bar; `internal/workers` sits at 37.5% because its untested half is the broker
-supervisor and the consumer loops, which cannot be reached without a connection
-that can be severed on demand. That is the next section.
+**Past the >80% the brief asks for at `README.md:164`, and every package is
+individually above it** — so the number is not one well-covered package carrying
+several thin ones.
+
+The figure is worth reading with its history, though. It went 44.8% → 54.8% →
+71.6% → 77.1% → 82.1%, and the steps that mattered were not the ones that moved
+it most. Writing the payment saga tests found two real bugs; writing the refund
+consumer tests closed the largest correctness gap in the system and moved the
+number barely at all. Coverage is a useful prompt for *where to look next*. It is
+a poor measure of whether the dangerous paths were exercised concurrently, which
+is the only way this system's bugs appear.
 
 What the number does *not* capture is that the coverage is deliberately
 concentrated on the parts that can lose money or corrupt data — the conditional
@@ -523,65 +598,16 @@ That said, the gap is real and closable. The cheapest wins, in order:
 
 ## 12. What is not covered, and why
 
-Every remaining gap falls into one of four buckets. They are listed with what it
-would actually take to close them, because "untested" without a reason is just an
-apology.
+Two buckets remain, both deliberate. They are listed with what closing them would
+cost, because "untested" without a reason is just an apology.
 
-### 12.1 Needs a severable broker connection — the SIGKILL bucket
+> The two buckets that used to sit here — the broker supervisor and the consumer
+> loops — are now covered; see §9.6 and §9.7. The supervisor tests kill the
+> connection from the broker side via the management API rather than needing a
+> `SIGKILL`, which turned out to be both faster and more deterministic. What a
+> real `SIGKILL` would still add is noted in §12.3.
 
-**`internal/workers/supervisor.go` — 45 statements, 0% covered.** The single
-largest untested unit, and the only one that genuinely resists ordinary testing.
-
-This is the code that fixed the worst bug in the project: an AMQP connection was
-acquired once at startup and never redialled, so after RabbitMQ dropped it the
-relay failed **241 consecutive publishes** while its health check stayed green
-and the entire async pipeline silently stopped.
-
-Testing it requires making a live connection die *underneath* a running session —
-not closing it politely, which is a different code path. Options:
-
-| Approach | Cost |
-|---|---|
-| **toxiproxy** between the app and RabbitMQ | Best fidelity. Adds a container and a control API; can sever mid-publish on demand |
-| **testcontainers RabbitMQ**, stopped mid-session | No extra dependency, but stop/start is slow and the timing is coarse |
-| **Management API**, force-close the connection | Light, but it closes politely-ish and may not reproduce a hard drop |
-| **A real `SIGKILL`** of a worker subprocess | Tests the whole thing end to end, including redelivery |
-
-The `SIGKILL` variant is the most valuable and the most awkward, and it is worth
-being precise about *why* it is awkward, because it is not the killing:
-
-- **Determinism.** The process must be killed at a specific moment — after the
-  `PENDING → CHARGING` CAS, before settlement. `PAYMENT_LATENCY` is already
-  configurable, so setting it to 30s gives a wide, reliable window. That part is
-  easy.
-- **Process lifecycle.** The test must build the binary, start it with the right
-  environment, wait for readiness (poll the database until the order reaches
-  `CHARGING`), kill it, and capture its stderr so a failure is diagnosable rather
-  than mysterious.
-- **Speed and flakiness.** Seconds, not milliseconds, and it depends on process
-  scheduling. It belongs behind a build tag or `-short` guard so it does not run
-  on every save.
-
-What it would prove that nothing currently does: **that RabbitMQ actually
-redelivers the unacked message** when a consumer's connection dies, and that the
-*real binary's* wiring recovers. Today both are argued from the code rather than
-demonstrated. `killWorkerMidCharge` reproduces the database state a dead worker
-leaves behind — which is enough to test the recovery logic, and is deliberately
-kept for being fast and deterministic — but it cannot prove the broker half.
-
-### 12.2 Needs a live consumer, but nothing killed
-
-**`internal/workers/consumer.go` (34 statements), `broker.go` `Consume`,
-`relay.go` `Run`.** These need a broker and a running loop, but no failure
-injection: publish a message, let the consumer handle it, assert the ack.
-
-The interesting cases are the ack/nack policy — a handler error nacks with
-requeue on first delivery and dead-letters on the second, so a poison message
-cannot loop forever. That is testable today with the existing RabbitMQ; it simply
-has not been written. Roughly a day, and it would take `internal/workers` from
-37.5% to most of the way.
-
-### 12.3 Error branches — needs fault injection
+### 12.1 Error branches — needs fault injection
 
 **~250 statements**, spread thinly across every file as
 `if err != nil { return err }`. These fire only when the database itself fails
@@ -597,7 +623,37 @@ uniform; the risk they carry is low, and the machinery to reach them would cost
 more clarity than it buys confidence. Coverage percentage is the wrong reason to
 add it.
 
-### 12.4 Not worth testing
+### 12.2 What a real `SIGKILL` would still add
+
+The supervisor tests kill the *connection*. They do not kill a *process*, and
+there is one thing only that can demonstrate:
+
+**That RabbitMQ actually redelivers an unacked message when a consumer dies
+mid-handler.** Today `killWorkerMidCharge` reproduces the database state a dead
+worker leaves behind — enough to test the recovery logic, and deliberately kept
+for being fast and deterministic — but the broker half is still argued from the
+code rather than shown.
+
+The shape it would take, since the pieces already exist:
+
+1. `exec.Command` the real `cmd/worker` binary with `PAYMENT_LATENCY=30s`, which
+   gives a wide, reliable window rather than a race against the scheduler.
+2. Place an order and poll the database until it reaches `CHARGING` — the worker
+   is now inside the provider call.
+3. `Process.Kill()`. A real `SIGKILL`: no deferred cleanup, no graceful channel
+   close, no ack.
+4. Assert the message is redelivered **and** that `RecoverStuckCharges` completes
+   the order.
+
+The awkwardness is not the killing. It is process lifecycle — building the
+binary, wiring its environment, capturing stderr so a failure is diagnosable
+rather than mysterious — plus the fact that it runs in seconds and depends on
+process scheduling, so it belongs behind a build tag rather than on every save.
+
+Worth doing eventually. It is no longer the largest gap, because the reconnect
+path it was mainly wanted for is now covered directly.
+
+### 12.3 Not worth testing
 
 - **`cmd/*` entry points.** Wiring only. The logic they wire is covered, and a
   test would assert that the code is shaped the way it is shaped.
@@ -657,7 +713,7 @@ Context on what moved, and why the number is not the point:
 | `internal/models` 87.0% | 100% | State machine reachability, enum round-trips |
 | `pkg/logger` 58.0% | 100% | Trace id propagation |
 | `pkg/database` 75.0% | 91.7% | Error classification through wrapped errors |
-| **total 44.8%** | **77.1%** | |
+| **total 44.8%** | **82.1%** | |
 
 Several of those found real defects rather than moving a percentage: the
 worker-death recovery gap, the reconciliation CAS that abandoned half its work,
