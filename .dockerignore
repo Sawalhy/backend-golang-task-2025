@@ -1,0 +1,11 @@
+# Keep the build context small: everything here would be copied into the builder
+# and invalidate its cache on every change.
+.git
+.gitignore
+.claude
+.env
+*.md
+docs/
+bin/
+scripts/
+docker-compose.yml

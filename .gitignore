@@ -1,0 +1,12 @@
+# Secrets. .env.example is committed; .env is not.
+.env
+
+# Build output
+/bin/
+/out/
+*.exe
+
+# Go test artifacts
+*.test
+coverage.out
+coverage.html
