@@ -383,8 +383,35 @@ pointing it at `orders` would wipe the running stack.
 Integration tests run the real migration files, not `AutoMigrate`, because the
 CHECK constraints and partial unique indexes *are* the invariants under test.
 
-Current state: **18 passing** — 7 rollup, 4 SSE, 7 hub (the hub set clean under
-`-race`).
+Current state: **32 passing** — 7 oversell/concurrency, 7 reaper, 7 rollup,
+4 SSE, 3 backplane, plus 7 hub unit tests (the hub set clean under `-race`).
+
+### The tests were checked for teeth
+
+A concurrency test that passes proves nothing until you have watched it fail.
+`Reserve` was temporarily reverted to the naive read-then-write —
+`SELECT available`, check it in Go, then `UPDATE` — and the suite was re-run:
+
+```
+--- FAIL: TestConcurrentBuyersCannotExceedStock
+    unexpected error: reserving 1 of product 1: ERROR: new row for relation
+    "inventory" violates check constraint "inventory_available_check" (23514)
+    ... × 24
+    expected: 53   actual: 29
+```
+
+Twenty-four buyers passed the in-Go check simultaneously, exactly as the design
+predicts. It also demonstrates the second guard doing its job: `available` never
+went negative, because `CHECK (available >= 0)` refused the writes the
+application logic wrongly allowed. The `WHERE` clause turns an oversell into a
+clean 409; the constraint is what makes corruption impossible even when the code
+above it is wrong.
+
+The mutation was reverted and the suite is green again.
+
+**Concurrency tests use a barrier**: every goroutine blocks on one channel and is
+released together. Started in a plain loop they never collide, and the test
+passes against code that oversells freely.
 
 **Nothing mocks the database, on purpose.** A mock returns what you told it to,
 so it is structurally incapable of exhibiting a race — it cannot lose an update,
@@ -395,10 +422,10 @@ database race, so a mock-based suite would pass while the system oversold stock.
 
 Stated plainly, because silence reads as unfinished.
 
-- **Oversell regression test** — the guarantee is currently demonstrated by
-  `cmd/loadtest -mode burst` and verified by hand, not by a test in the suite.
-  The harness in `tests/` now exists, so this is a short job and the next thing
-  worth doing.
+- **Payment saga tests** — the cancel-vs-charge race (failure mode D) and the
+  `UNKNOWN` reconciliation path are exercised by hand and by the running system,
+  but not yet by the suite. They are the most valuable remaining tests, and the
+  harness makes them straightforward.
 - **Real-time inventory push** — order status streams; stock levels do not.
   Broadcasting every decrement to every browsing customer is a firehose that
   serves almost nobody, and the number is stale the instant it is rendered
