@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -107,11 +108,10 @@ func TestTokenBucketIsAtomicUnderConcurrency(t *testing.T) {
 
 	const (
 		callers = 200
+		rate    = 1 // tokens per second: the slowest refill the limiter allows
 		burst   = 20
 	)
-	// rate 1/s so refill during the burst is negligible and the expected count
-	// is exact rather than approximate.
-	limiter := NewRateLimiter(rdb, 1, burst)
+	limiter := NewRateLimiter(rdb, rate, burst)
 	key := uniqueKey(t)
 
 	var (
@@ -130,8 +130,11 @@ func TestTokenBucketIsAtomicUnderConcurrency(t *testing.T) {
 		}(i)
 	}
 	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
 	close(release)
 	wg.Wait()
+	elapsed := time.Since(start)
 
 	granted := 0
 	for i, allowed := range results {
@@ -141,8 +144,20 @@ func TestTokenBucketIsAtomicUnderConcurrency(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, burst, granted,
-		"exactly the burst may be granted; more means the read-modify-write leaked")
+	// The bucket refills while the run is in progress, so an exact equality here
+	// would be over-specified and would flake the moment the machine is slow.
+	// The invariant is the ceiling: capacity, plus whatever legitimately accrued
+	// during the window, plus one for rounding.
+	maxLegitimate := burst + int(math.Ceil(elapsed.Seconds()*rate)) + 1
+
+	assert.GreaterOrEqual(t, granted, burst, "the full burst must be usable")
+	assert.LessOrEqual(t, granted, maxLegitimate,
+		"granted %d in %s; more than capacity plus refill means the read-modify-write leaked",
+		granted, elapsed)
+
+	// And the headline: a leaking limiter would let most of the 200 through.
+	assert.Less(t, granted, callers/2,
+		"a non-atomic limiter grants most callers; this must stay near the burst")
 }
 
 // A limiter is a guard rail, not the service. If Redis is unreachable, rejecting
@@ -159,6 +174,7 @@ func TestRateLimiterFailsOpenWhenRedisIsUnreachable(t *testing.T) {
 		Addr:        "127.0.0.1:1",
 		DialTimeout: 200 * time.Millisecond,
 		ReadTimeout: 200 * time.Millisecond,
+		MaxRetries:  -1, // fail immediately; retrying a dead host just adds noise
 	})
 	defer func() { _ = dead.Close() }()
 
