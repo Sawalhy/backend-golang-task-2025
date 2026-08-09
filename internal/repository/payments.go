@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -112,6 +113,52 @@ func (r *PaymentRepo) IncrementAttempts(ctx context.Context, tx *gorm.DB, id uui
 		return fmt.Errorf("incrementing attempts for payment %s: %w", id, err)
 	}
 	return nil
+}
+
+// ClaimStuckIntents finds payment intents abandoned by a worker that died.
+//
+// This is the other half of failure mode E. The "runs twice" half is covered by
+// CAS everywhere; this is the "gets stuck" half, and it needs its own sweep
+// because nothing else can see it:
+//
+//   - Redelivery cannot recover it. ProcessOrder skips any order that is not
+//     PENDING, and a half-charged order is CHARGING.
+//   - The reaper cannot. It only moves PENDING -> EXPIRED, and deliberately so:
+//     expiring a CHARGING order would release stock for a live payment.
+//   - Reconciliation cannot. It only looks at UNKNOWN, and this intent is
+//     INITIATED — nobody ever got an answer to record.
+//
+// So an order whose worker was SIGKILLed mid-charge sits in CHARGING forever,
+// holding its stock, with the customer possibly charged. Only a timer finds it,
+// for the same reason the reaper is a timer: no event announces that a process
+// stopped existing.
+//
+// Bumping updated_at IS the claim. It doubles as the lease — a row just touched
+// is outside the `older than` window, so a second sweeper skips it — which
+// avoids a separate lease column for a path that runs every few minutes.
+// Re-driving the provider is safe regardless, because the idempotency key has
+// not changed.
+func (r *PaymentRepo) ClaimStuckIntents(ctx context.Context, tx *gorm.DB, olderThan time.Duration, limit int) ([]models.Payment, error) {
+	var out []models.Payment
+
+	err := r.txOrDB(tx).WithContext(ctx).Raw(`
+		UPDATE payments SET updated_at = now()
+		 WHERE id IN (
+		   SELECT p.id
+		     FROM payments p
+		     JOIN orders   o ON o.id = p.order_id
+		    WHERE p.status IN ('INITIATED','UNKNOWN')
+		      AND o.status IN ('CHARGING','CANCELLING')
+		      AND p.updated_at < now() - (? * interval '1 second')
+		    ORDER BY p.updated_at
+		    FOR UPDATE OF p SKIP LOCKED
+		    LIMIT ?
+		 )
+		RETURNING *`, olderThan.Seconds(), limit).Scan(&out).Error
+	if err != nil {
+		return nil, fmt.Errorf("claiming stuck payment intents: %w", err)
+	}
+	return out, nil
 }
 
 // ListForOrder backs GET /orders/{id}/status, which needs attempt history:

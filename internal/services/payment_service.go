@@ -217,13 +217,20 @@ func (s *PaymentService) settleSuccess(ctx context.Context, orderID uint64, paym
 
 func (s *PaymentService) settleDecline(ctx context.Context, orderID uint64, payment *models.Payment, reason string) error {
 	return s.store.InTx(ctx, func(ctx context.Context, tx *gorm.DB) error {
-		ok, err := s.store.Payments().SetStatus(ctx, tx, payment.ID,
-			models.PaymentInitiated, models.PaymentDeclined, nil)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return nil // already settled by a duplicate
+		// Only CAS the intent when it is still INITIATED. Reconciliation arrives
+		// here with a payment already moved out of UNKNOWN, and an unconditional
+		// CAS would find the row in the wrong state, return false, and abandon
+		// the ORDER half of the settlement — leaving it stuck in CHARGING with
+		// its stock held forever. Mirrors the same guard in settleSuccess.
+		if payment.Status == models.PaymentInitiated {
+			ok, err := s.store.Payments().SetStatus(ctx, tx, payment.ID,
+				models.PaymentInitiated, models.PaymentDeclined, nil)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil // already settled by a duplicate delivery
+			}
 		}
 
 		order, err := s.store.Orders().GetForUpdate(ctx, tx, orderID)
@@ -245,8 +252,8 @@ func (s *PaymentService) settleDecline(ctx context.Context, orderID uint64, paym
 			return nil
 		}
 
-		ok, err = s.store.Orders().Transition(ctx, tx, orderID, order.Status, to)
-		if err != nil || !ok {
+		moved, err := s.store.Orders().Transition(ctx, tx, orderID, order.Status, to)
+		if err != nil || !moved {
 			return err
 		}
 		if err := s.releaseReservations(ctx, tx, orderID); err != nil {

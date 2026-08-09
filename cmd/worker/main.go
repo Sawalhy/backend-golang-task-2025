@@ -146,6 +146,29 @@ func run() error {
 		})
 	})
 
+	// Recovers charges abandoned by a worker that died mid-payment (the other
+	// half of failure mode E). Nothing else can see these: redelivery skips
+	// non-PENDING orders, the reaper only expires PENDING ones, and
+	// reconciliation only looks at UNKNOWN. A timer is the only thing that can
+	// notice a process stopped existing.
+	//
+	// The grace period must exceed the provider timeout, or this "recovers"
+	// payments that are merely slow while their first call is still in flight.
+	g.Go(func() error {
+		grace := 4 * cfg.Payments.Timeout
+		if grace < time.Minute {
+			grace = time.Minute
+		}
+		return everyTick(gctx, time.Minute, func(ctx context.Context) {
+			if _, err := payments.RecoverStuckCharges(ctx, grace, 50); err != nil {
+				log.Error("recovering stuck charges", "error", err)
+			}
+			if _, err := payments.SweepUnknownPayments(ctx, 50); err != nil {
+				log.Error("sweeping unknown payments", "error", err)
+			}
+		})
+	})
+
 	// Materialises closed days into daily_sales_rollup.
 	//
 	// This is the other kind of time-triggered work: nothing happens at midnight

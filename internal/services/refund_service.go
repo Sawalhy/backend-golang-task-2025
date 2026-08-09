@@ -137,13 +137,16 @@ func (s *PaymentService) resolveUnknown(ctx context.Context, payment *models.Pay
 
 	// Reuse the ordinary settle paths so the order transitions, reservations and
 	// events are handled in exactly one place.
+	//
+	// The intent has ALREADY been moved out of UNKNOWN above, so the copy passed
+	// down carries its real new status. Both settle paths skip their own payment
+	// CAS when the status is not INITIATED — claiming it were INITIATED here
+	// would make that CAS fail and silently abandon the order half of the work.
 	settled := *payment
-	switch to {
-	case models.PaymentSucceeded:
-		settled.Status = models.PaymentSucceeded
+	settled.Status = to
+
+	if to == models.PaymentSucceeded {
 		return s.settleSuccess(ctx, payment.OrderID, &settled, "")
-	default:
-		settled.Status = models.PaymentInitiated
-		return s.settleDecline(ctx, payment.OrderID, &settled, "reconciled: provider never charged")
 	}
+	return s.settleDecline(ctx, payment.OrderID, &settled, "reconciled: provider never charged")
 }
