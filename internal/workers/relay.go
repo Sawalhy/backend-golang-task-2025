@@ -64,7 +64,7 @@ func (r *Relay) Run(ctx context.Context) error {
 			// Drain fully rather than one batch per tick, so a backlog clears at
 			// broker speed instead of batchSize per interval.
 			for {
-				n, err := r.drainOnce(ctx)
+				n, err := r.DrainOnce(ctx)
 				if err != nil {
 					// Log and keep going. A broker blip must not kill the relay;
 					// unsent rows stay unsent and the next tick retries them.
@@ -79,7 +79,8 @@ func (r *Relay) Run(ctx context.Context) error {
 	}
 }
 
-// drainOnce claims a batch, publishes it, and marks it sent.
+// DrainOnce claims a batch, publishes it, and marks it sent. Exported so a test
+// or an operator can drain deterministically instead of waiting on the ticker.
 //
 // DELIBERATE EXCEPTION to "never do network I/O inside a transaction": the
 // publish happens while the claiming transaction is still open. That rule exists
@@ -92,7 +93,7 @@ func (r *Relay) Run(ctx context.Context) error {
 // second transaction re-creates the dual write the outbox exists to remove: a
 // crash between the two leaves rows claimed-but-unpublished with nothing to
 // recover them.
-func (r *Relay) drainOnce(ctx context.Context) (int, error) {
+func (r *Relay) DrainOnce(ctx context.Context) (int, error) {
 	var published int
 
 	err := r.store.InTx(ctx, func(ctx context.Context, tx *gorm.DB) error {
