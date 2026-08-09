@@ -1,0 +1,166 @@
+# `docker compose up` brings up the entire system. This is how the project is
+# meant to be run and evaluated, so it is expected to work from a clean clone
+# with no manual steps.
+#
+# Startup ordering is handled with healthchecks and condition: service_healthy
+# rather than depends_on alone — plain depends_on waits for the CONTAINER to
+# start, not for Postgres to be ready to accept connections, which is the classic
+# "connection refused on first boot" race.
+
+name: order-processing
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: orders
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -U and -d are required: without them pg_isready checks the wrong
+      # database and reports healthy before ours exists.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    command:
+      # The pool sizing in .env assumes a small Postgres; raising
+      # max_connections here would hide pool exhaustion rather than fix it.
+      - "postgres"
+      - "-c"
+      - "max_connections=100"
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"    # amqp
+      - "15672:15672"  # management UI: guest / guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot. Runs to completion, then api/worker/relay start.
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    entrypoint: ["/app/migrate", "up"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/orders?sslmode=disable
+      MIGRATIONS_DIR: /app/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # One-shot, idempotent: existing rows are skipped rather than duplicated.
+  seed:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    entrypoint: ["/app/seed"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/orders?sslmode=disable
+      BCRYPT_COST: "10"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    entrypoint: ["/app/api"]
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: info
+      HTTP_PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/orders?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_ADDR: redis:6379
+      JWT_SECRET: dev-secret-change-me-in-production-0123456789
+      DB_MAX_OPEN_CONNS: "12"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/api", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    entrypoint: ["/app/worker"]
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/orders?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_ADDR: redis:6379
+      WORKER_CONCURRENCY: "10"
+      REAPER_INTERVAL: "30s"
+      # Deliberately non-zero so declines, timeouts and the UNKNOWN path are all
+      # reachable in a demo rather than only in tests.
+      PAYMENT_FAILURE_RATE: "0.10"
+      PAYMENT_TIMEOUT_RATE: "0.02"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    # Must exceed the longest in-flight job, or a rolling restart SIGKILLs a
+    # worker mid-payment.
+    stop_grace_period: 40s
+    # Scale with: docker compose up --scale worker=4
+    # Competing consumers share the queues, so this needs no code change.
+
+  relay:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    entrypoint: ["/app/relay"]
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/orders?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RELAY_INTERVAL: "500ms"
+      RELAY_BATCH_SIZE: "100"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    stop_grace_period: 20s
+    # Safe to scale: rows are claimed with FOR UPDATE SKIP LOCKED, so two relays
+    # never publish the same event.
+
+volumes:
+  pgdata:
