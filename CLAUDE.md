@@ -90,7 +90,27 @@ Follow the structure at `README.md:120` exactly; deviating loses marks for no ga
 
 ## Commands
 
-No code yet. Add build/test/lint commands here as they exist.
+Go is **not installed on this machine**. `scripts/go.ps1` runs the toolchain in a
+Docker container with persistent module and build caches; it takes the same
+arguments as `go`. If Go gets installed locally, use `go` directly and delete it.
+
+```powershell
+.\scripts\go.ps1 build ./...        # compile all five binaries
+.\scripts\go.ps1 vet ./...
+.\scripts\go.ps1 test ./... -race
+.\scripts\go.ps1 mod tidy
+```
+
+Running the system:
+
+```bash
+docker compose up --build           # postgres, rabbitmq, redis, migrate, seed, api, worker, relay
+docker compose logs -f worker       # watch the payment pipeline
+docker compose exec postgres psql -U postgres -d orders
+```
+
+Entry points: `cmd/api`, `cmd/worker`, `cmd/relay`, plus `cmd/migrate` and
+`cmd/seed`. Migrations run via `/app/migrate up`; never AutoMigrate.
 
 ## Do not
 
