@@ -1954,14 +1954,56 @@ CREATE INDEX ON payments      (order_id);
 CREATE INDEX ON notifications (order_id);
 ```
 
-**Partial indexes for the claim queries** — these stay tiny forever, because completed rows leave the
-index entirely:
+**Partial indexes for the claim queries.** The two hot polling queries are the relay claiming unsent
+outbox rows and the reaper finding expired reservations:
+
+```sql
+SELECT id FROM outbox WHERE sent_at IS NULL
+ ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 100;
+
+SELECT id FROM reservations WHERE status = 'HELD' AND expires_at < now()
+ ORDER BY expires_at FOR UPDATE SKIP LOCKED LIMIT 100;
+```
+
+*(`SKIP LOCKED`, since it keeps coming up: when `SELECT … FOR UPDATE` meets a row another transaction
+has locked, the default is to **wait**. `SKIP LOCKED` says act as if the row isn't there and move on.
+Without it, ten workers running `… LIMIT 1 FOR UPDATE` all queue behind the same row, wake when the
+winner commits, re-check, find it taken, and get nothing — ten workers with the throughput of one.
+With it, worker 2 skips past and takes the next row. It is the single clause that makes a database
+table usable as a work queue.)*
+
+The obvious index — on `status`, or on `sent_at` — works, and is a trap. Run the numbers: after a
+year `reservations` holds ~12M rows, but a reservation is `HELD` for at most 15 minutes before
+becoming `COMMITTED` or `EXPIRED` forever, so at any instant maybe **50** rows are interesting. You'd
+maintain a 12M-entry index, pay for it on every insert and transition, and keep it in the buffer
+cache — to find 50 rows. `outbox` is worse: 40M rows, dozens unsent.
+
+**Partial indexes** put a `WHERE` on the index itself, so only matching rows get an entry — and when a
+row *stops* matching, Postgres removes it:
 
 ```sql
 CREATE INDEX outbox_unsent    ON outbox        (id)         WHERE sent_at IS NULL;
 CREATE INDEX res_expiring     ON reservations  (expires_at) WHERE status = 'HELD';
 CREATE INDEX notif_claimable  ON notifications (id)         WHERE status IN ('UNCLAIMED','SENDING');
 ```
+
+> **The index size tracks the size of the backlog, not the size of the table.** 40M rows in `outbox`,
+> ~50 in the index. A few kilobytes, permanently cached, forever.
+
+Key column follows the `ORDER BY` — `(id)` for outbox, `(expires_at)` for reservations. The filter
+selecting *which* rows participate belongs in the index's `WHERE`, not in the key.
+
+**Trap:** Postgres uses a partial index only when the planner can *prove* the query predicate implies
+the index predicate.
+
+```sql
+WHERE sent_at IS NULL                    -- ✅ exact
+WHERE sent_at IS NULL AND attempts < 5   -- ✅ stricter, still provable
+WHERE sent_at = $1                       -- ❌ never, even when $1 is NULL at runtime
+```
+
+Partial indexes are made for **queue-shaped tables** — rows pass briefly through an interesting state
+then rest forever in a boring one. Three of our eleven are that shape.
 
 **Composites — equality column first, then sort:**
 
@@ -1975,14 +2017,21 @@ CREATE INDEX ON orders   (created_at) WHERE status IN ('PAID','FULFILLED');  -- 
 **Unique indexes that are invariants, not performance** (§5.11) — these belong in migration 001:
 
 ```sql
-CREATE UNIQUE INDEX ON payments      (order_id) WHERE status IN ('INITIATED','SUCCEEDED');  -- P1
+CREATE UNIQUE INDEX ON payments      (order_id)
+  WHERE status IN ('INITIATED','UNKNOWN','SUCCEEDED');                                      -- P1
 CREATE UNIQUE INDEX ON notifications (order_id, channel, kind);                             -- N1
 CREATE UNIQUE INDEX ON orders (idempotency_key) WHERE idempotency_key IS NOT NULL;
 ```
 
-The partial unique on `payments` is the subtle one: many `DECLINED` attempts are legal, but at most
-one live-or-successful payment per order. That's mode C's guarantee expressed as a constraint rather
-than as code.
+The partial unique on `payments` is the subtle one. **One row per payment *intent*** — not per
+attempt (same intent retried reuses the row *and the key*, which is the whole mechanism) and not per
+order (a declined card followed by a different card is a genuinely new intent with a new key). So
+`DECLINED, DECLINED, SUCCEEDED` is a legal history; two live intents are not.
+
+`UNKNOWN` must be in the blocking set: it means *"the customer may or may not have been charged"*,
+and opening a second intent in that state can double-charge for real. `REFUNDED` is excluded — a
+refunded order may legitimately be paid again. That's mode C's guarantee expressed as a constraint
+rather than as code.
 
 #### What to index — and the one place not to
 
