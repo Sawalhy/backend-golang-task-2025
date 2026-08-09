@@ -34,6 +34,7 @@ type scriptedProvider struct {
 	outcome   services.PaymentOutcome
 	reason    string
 	chargeErr error
+	refundErr error // when set, the provider refuses the refund
 
 	results map[string]services.ChargeResult
 	calls   map[string]int
@@ -100,6 +101,9 @@ func (p *scriptedProvider) Charge(ctx context.Context, req services.ChargeReques
 func (p *scriptedProvider) Refund(ctx context.Context, providerRef string, amountCents int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.refundErr != nil {
+		return p.refundErr // refused: no money moved, so nothing is counted
+	}
 	p.refunds++
 	return nil
 }
