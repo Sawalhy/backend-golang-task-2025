@@ -2040,7 +2040,14 @@ rather than as code.
 | `WHERE` columns | equality and range |
 | `ORDER BY` columns | the index supplies the order; no sort node |
 | **Foreign keys** | Postgres won't do it for you — the most common miss |
-| composite order | equality → range → sort. `(user_id, created_at)` serves `WHERE user_id=? ORDER BY created_at`; reversed it doesn't |
+| composite order | **equality → range → sort**, *not* "most selective first" — that rule is about competing equality columns, and a sort column has no selectivity |
+
+On composite order: a btree is sorted lexicographically, so with `(user_id, created_at)` all of one
+user's rows are **contiguous** and already ordered within that block — seek once, walk 20, stop.
+Reversed, that user's rows are scattered across the whole index and Postgres must scan until it has
+collected 20 hits. Two corollaries: **a leading column can be used alone, a trailing one cannot**
+(`(user_id, created_at)` also serves plain `WHERE user_id = ?`), and **don't cargo-cult `DESC`** —
+Postgres scans btrees backwards, so direction only matters for mixed sorts like `ORDER BY a, b DESC`.
 
 Against all of that: **every index is a write cost** — more WAL, more bloat, more vacuum. And
 updating an *indexed* column prevents a HOT (heap-only-tuple) update, forcing index writes too.
@@ -2052,6 +2059,99 @@ updating an *indexed* column prevents a HOT (heap-only-tuple) update, forcing in
 
 Verify rather than guess: `EXPLAIN (ANALYZE, BUFFERS)` on the five hot queries, and
 `pg_stat_user_indexes` after the load test to find indexes nothing ever used.
+
+### 5.19 Topic 9 — observability
+
+*2026-08-09.*
+
+#### The trace ID is the tool; everything else is plumbing
+
+One id generated at the API edge that travels with the work:
+
+```
+POST /orders          trace_id=a4f2…  → every log line in the handler carries it
+  └─ INSERT outbox     trace_id stored as a COLUMN on the row     ← the crucial bit
+       └─ relay        reads it back into the AMQP `traceparent` header
+            └─ consumer  extracts it; every log line carries it
+```
+
+The column is what makes it work. Handler and consumer are separate processes running minutes apart
+with no call stack between them, so the id has to be **written down and carried in the message** —
+the same move as everything else in this system. And it is why `context.Context` must be threaded
+from the first function: the span lives in the context, and retrofitting that touches every
+signature in the codebase.
+
+| Layer | Tool | Answers |
+|---|---|---|
+| Structured logs | `log/slog` → JSON | *what happened* — query `order_id=1001`, don't regex prose |
+| Aggregation | Loki + Grafana, or `docker compose logs \| jq` | so you never SSH into eight containers |
+| Tracing | OpenTelemetry → Jaeger/Tempo | *where the time went* — one waterfall per request |
+
+`otelgin` middleware, spans around DB calls, `traceparent` into the outbox row and up into AMQP
+headers, consumer starts its span with that remote parent. `README.md:258`'s bonus point, ~60 lines.
+
+#### Prometheus, mechanically
+
+The app exposes `GET /metrics` returning plain text; Prometheus scrapes it every 15s and stores each
+number as a time series; alert rules run over those series. No agent, no push.
+
+```go
+var outboxAge = promauto.NewGauge(prometheus.GaugeOpts{
+    Name: "outbox_oldest_unsent_seconds", Help: "Age of the oldest unpublished outbox row"})
+outboxAge.Set(seconds)                            // in the relay loop
+r.GET("/metrics", gin.WrapH(promhttp.Handler()))  // once at startup
+```
+
+**Counter** (only rises, query its rate) · **Gauge** (rises and falls) · **Histogram** (buckets →
+p50/p95/p99).
+
+#### What to watch — and why health checks aren't it
+
+> **Every failure mode in §4 leaves all eight containers healthy and every endpoint returning 200.**
+
+| Mode | Metric | Page when |
+|---|---|---|
+| B stranded | `outbox_oldest_unsent_seconds` | > 60s |
+| E worker died | `rate(jobs_reclaimed_total)` | sustained > 0 — leases expiring means processes dying |
+| C ambiguous payment | `payments_unknown` | > 0 for minutes — the "we may have charged them" pile |
+| F abandoned stock | `rate(reservations_expired_total)` | spike — payments failing, not customers bored |
+| D/I poison | `rabbitmq_queue_messages{queue=~".*dlq"}` | > 0 |
+| G deadlock | `rate(deadlock_retries_total)` | above baseline — something bypassed the sort |
+| J pool | `db_pool_in_use / db_pool_max` | > 80% sustained |
+
+Keep the list to five to eight. An alert nobody acts on trains everyone to ignore alerts.
+
+#### Why the outbox carries mode B's metric *(Ahmed's challenge)*
+
+The outbox is not the *cause*, it is the **instrument**. Before it, a stranded order left no trace —
+its row said `PENDING`, identical to a healthy in-flight one, and there was nothing to count. The
+outbox doesn't make the failure impossible; it makes it **visible**: a row with `sent_at IS NULL` and
+a `created_at` is a physical record saying *"this was promised and hasn't happened."*
+
+| Actual fault | Signature |
+|---|---|
+| Relay crashed or never deployed | count and age climb together |
+| RabbitMQ unreachable, confirms failing | same signature, different cause |
+| Relay slower than the insert rate | count climbs, age climbs slowly |
+| **Poison row** | **count stays small, age climbs fast** |
+
+> **Measure the age of the oldest item, not the size of the queue.** `outbox_unsent_rows` can sit at
+> 3 forever while one poisoned row never leaves.
+
+#### Design gap this exposed: head-of-line blocking in the relay
+
+The relay processes `ORDER BY id`. A row whose payload fails to serialise, or whose routing key
+nothing binds with `mandatory: true`, will be retried forever — and if failure is handled per
+*batch*, **everything behind it is blocked**. Ten rows pending, none moving, count-based alerting
+blind to it.
+
+What the `attempts` column is for, and it needs saying:
+
+- mark rows **individually**, never per batch — one failure must not roll back 99 healthy neighbours
+- increment `attempts` on failure
+- after N attempts, park the row (`status='failed'`) and alert, so it stops blocking the queue
+
+The consumer-side dead-letter idea, applied to the producer side.
 
 ---
 
@@ -2067,9 +2167,9 @@ Verify rather than guess: `EXPLAIN (ANALYZE, BUFFERS)` on the five hot queries, 
 | 5 | Redis — caching vs. materialising; rate limiting | — | ✅ done (§5.17) |
 | 6 | Go idioms — the five tells | — | **shelved at Ahmed's request 2026-08-09.** Still owed (§9) |
 | 7 | Schema and indexing strategy | — | ✅ done (§5.18) |
-| **8** | **Testing — unit, integration, concurrency, load** | — | **← next** |
-| 9 | Observability — metrics, structured logging, distributed tracing | — | queued |
-| 10 | The WAL, and how CDC relates to the outbox | — | queued (§9) |
+| 8 | Testing — unit, integration, concurrency, load | — | **skipped as a discussion 2026-08-09.** Tests still get written at build-order step 7 — the concurrency tests are the only evidence the graded core works |
+| 9 | Observability — metrics, structured logging, distributed tracing | — | ✅ done (§5.19) |
+| **10** | **The WAL, and how CDC relates to the outbox** | — | **← last one** |
 
 **Sequencing decision (2026-08-09).** Topics 8–10 do not block implementation and can follow it. Two
 things must nonetheless be right from the first commit, because retrofitting them is expensive:
@@ -2135,9 +2235,15 @@ still completes.
 
 ## 9. Owed
 
-Requested 2026-08-09: a proper walkthrough of **the WAL and how the outbox relates to it** — what
-Postgres's write-ahead log actually is, why it exists, and how pattern ③ (CDC/Debezium) reads it
-instead of an outbox table. Referenced in passing in §5.6 and §5.12, never explained.
+1. **The five non-native-Go tells** — goroutine leaks, channels where a mutex belonged, unthreaded
+   `context.Context`, unclosed `rows`, Java-shaped packages. Shelved 2026-08-09; now graded directly
+   by `README.md:216`, so deliver before implementation.
+2. **The WAL, and how CDC relates to the outbox** — what Postgres's write-ahead log actually is, why
+   it exists, and how pattern ③ (Debezium) reads it instead of an outbox table. Referenced in §5.6
+   and §5.12, never explained.
+3. **Hands-on reading on the observability tools** *(added 2026-08-09 at Ahmed's request)* —
+   Prometheus, Grafana, OpenTelemetry, Jaeger. He has never used any of them. §5.19 covers the
+   concepts and what to measure; this is the practical follow-up.
 
 
 Walkthrough of five non-native-Go tells: goroutine leaks, channels where a mutex belonged,
