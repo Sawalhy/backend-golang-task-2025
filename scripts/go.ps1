@@ -35,6 +35,7 @@ docker run --rm `
   -e GOFLAGS=-buildvcs=false `
   -e TEST_DATABASE_URL="$env:TEST_DATABASE_URL" `
   -e TEST_RABBITMQ_URL="$env:TEST_RABBITMQ_URL" `
+  -e TEST_REDIS_ADDR="$env:TEST_REDIS_ADDR" `
   @netArgs `
   golang:1.25 go @args
 
