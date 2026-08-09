@@ -6,6 +6,9 @@
 .env
 *.md
 docs/
+# ...but docs/swagger is generated GO SOURCE that routes.go imports, so the
+# build fails without it. The design notes above are excluded; this is not.
+!docs/swagger/
 bin/
 scripts/
 docker-compose.yml

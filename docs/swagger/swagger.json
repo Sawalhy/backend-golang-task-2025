@@ -1,0 +1,1512 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "Order processing with reserve-pay-commit inventory, an outbox\nrelay, and compare-and-swap state transitions throughout.\n\nPOST /orders returns 202, not 201: when it returns, stock is\nreserved and the order exists, but payment has not happened yet.\nPoll GET /orders/{id}/status for the outcome.",
+        "title": "Concurrent Order Processing API",
+        "contact": {},
+        "version": "1.0"
+    },
+    "host": "localhost:8080",
+    "basePath": "/api/v1",
+    "paths": {
+        "/admin/inventory/low-stock": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Low stock alerts",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "alert at or below this level (default 10)",
+                        "name": "threshold",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_repository.InventoryWithProduct"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/inventory/{id}": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Set absolute stock level",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "product id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "stock",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.restockRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Inventory"
+                        }
+                    },
+                    "400": {
+                        "description": "409 = version conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "409 = version conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "409 = version conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "409 = version conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/orders": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "List all orders",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "filter by status",
+                        "name": "status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "page size",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Order"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/orders/{id}/status": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Update an order's status",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "order id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "target status",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.updateOrderStatusRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/reports/daily": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Daily sales report",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "inclusive start date, YYYY-MM-DD (UTC)",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "exclusive end date, YYYY-MM-DD (UTC)",
+                        "name": "to",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_repository.DailyRow"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/login": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Log in and receive a JWT",
+                "parameters": [
+                    {
+                        "description": "credentials",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.loginRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.loginResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/orders": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "orders"
+                ],
+                "summary": "List your orders",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "page size",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "offset",
+                        "name": "offset",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "filter by status",
+                        "name": "status",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Order"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "orders"
+                ],
+                "summary": "Place an order",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "client retry key",
+                        "name": "Idempotency-Key",
+                        "in": "header"
+                    },
+                    {
+                        "description": "order",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.createOrderRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "202": {
+                        "description": "Accepted",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order"
+                        }
+                    },
+                    "400": {
+                        "description": "409 = insufficient stock",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "409 = insufficient stock",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "409 = insufficient stock",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/orders/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "orders"
+                ],
+                "summary": "Get an order",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "order id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/orders/{id}/cancel": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "orders"
+                ],
+                "summary": "Cancel an order",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "order id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "cancelled",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_services.CancelResult"
+                        }
+                    },
+                    "202": {
+                        "description": "cancellation pending payment outcome",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_services.CancelResult"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/orders/{id}/events": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Emits an initial `status` event with current state, then one event per transition. Terminates when the order reaches a terminal state.",
+                "produces": [
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "orders"
+                ],
+                "summary": "Stream order status changes (SSE)",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "order id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "event stream",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/orders/{id}/status": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "orders"
+                ],
+                "summary": "Get order status and payment attempts",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "order id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_services.OrderStatusView"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/products": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "products"
+                ],
+                "summary": "List products",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "page size (max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Product"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "products"
+                ],
+                "summary": "Create a product",
+                "parameters": [
+                    {
+                        "description": "product",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.createProductRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Product"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/products/{id}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "products"
+                ],
+                "summary": "Get product details",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "product id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Product"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "products"
+                ],
+                "summary": "Update a product",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "product id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "product",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.updateProductRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Product"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/products/{id}/inventory": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "products"
+                ],
+                "summary": "Check inventory for a product",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "product id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Inventory"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/users": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "users"
+                ],
+                "summary": "Register a user",
+                "parameters": [
+                    {
+                        "description": "user",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.createUserRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.User"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/users/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "users"
+                ],
+                "summary": "Get a user profile",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "user id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.User"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "users"
+                ],
+                "summary": "Update a user profile",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "user id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "profile",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.updateUserRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.User"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api_handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "github_com_Sawalhy_backend-golang-task-2025_internal_models.Inventory": {
+            "type": "object",
+            "properties": {
+                "available": {
+                    "type": "integer"
+                },
+                "product_id": {
+                    "type": "integer"
+                },
+                "reserved": {
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "integer"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_models.Order": {
+            "type": "object",
+            "properties": {
+                "cancelled_at": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "currency": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderItem"
+                    }
+                },
+                "paid_at": {
+                    "type": "string"
+                },
+                "status": {
+                    "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderStatus"
+                },
+                "total_cents": {
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderItem": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer"
+                },
+                "order_id": {
+                    "type": "integer"
+                },
+                "product_id": {
+                    "type": "integer"
+                },
+                "qty": {
+                    "type": "integer"
+                },
+                "unit_price_cents": {
+                    "description": "UnitPriceCents is a snapshot taken at order time. If this were a join to\nproducts.price, an admin raising a price would retroactively rewrite every\nhistorical order and every past report.",
+                    "type": "integer"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderStatus": {
+            "type": "string",
+            "enum": [
+                "PENDING",
+                "CHARGING",
+                "PAID",
+                "FAILED",
+                "CANCELLING",
+                "CANCELLED",
+                "CANCELLED_REFUNDED",
+                "EXPIRED",
+                "FULFILLED",
+                "REFUNDED"
+            ],
+            "x-enum-varnames": [
+                "OrderPending",
+                "OrderCharging",
+                "OrderPaid",
+                "OrderFailed",
+                "OrderCancelling",
+                "OrderCancelled",
+                "OrderCancelledRefunded",
+                "OrderExpired",
+                "OrderFulfilled",
+                "OrderRefunded"
+            ]
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_models.PaymentStatus": {
+            "type": "string",
+            "enum": [
+                "INITIATED",
+                "SUCCEEDED",
+                "DECLINED",
+                "UNKNOWN",
+                "REFUNDED"
+            ],
+            "x-enum-varnames": [
+                "PaymentInitiated",
+                "PaymentSucceeded",
+                "PaymentDeclined",
+                "PaymentUnknown",
+                "PaymentRefunded"
+            ]
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_models.Product": {
+            "type": "object",
+            "properties": {
+                "active": {
+                    "type": "boolean"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "currency": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "price_cents": {
+                    "type": "integer"
+                },
+                "sku": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_models.User": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "role": {
+                    "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.UserRole"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_models.UserRole": {
+            "type": "string",
+            "enum": [
+                "CUSTOMER",
+                "ADMIN"
+            ],
+            "x-enum-varnames": [
+                "RoleCustomer",
+                "RoleAdmin"
+            ]
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_repository.DailyRow": {
+            "type": "object",
+            "properties": {
+                "currency": {
+                    "type": "string"
+                },
+                "day": {
+                    "type": "string"
+                },
+                "gross_cents": {
+                    "type": "integer"
+                },
+                "orders_count": {
+                    "type": "integer"
+                },
+                "source": {
+                    "description": "Source makes the two halves of the report distinguishable rather than\nsilently blended: a closed day is a materialised fact, today is a moving\nnumber that will change before the day ends.",
+                    "type": "string"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_repository.InventoryWithProduct": {
+            "type": "object",
+            "properties": {
+                "available": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "product_id": {
+                    "type": "integer"
+                },
+                "reserved": {
+                    "type": "integer"
+                },
+                "sku": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_services.CancelResult": {
+            "type": "object",
+            "properties": {
+                "order": {
+                    "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order"
+                },
+                "pending": {
+                    "description": "true when a charge is in flight and the outcome is not yet known",
+                    "type": "boolean"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_services.OrderStatusView": {
+            "type": "object",
+            "properties": {
+                "cancelled_at": {
+                    "type": "string"
+                },
+                "currency": {
+                    "type": "string"
+                },
+                "order_id": {
+                    "type": "integer"
+                },
+                "paid_at": {
+                    "type": "string"
+                },
+                "payment_attempts": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_services.PaymentAttempt"
+                    }
+                },
+                "status": {
+                    "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderStatus"
+                },
+                "terminal": {
+                    "type": "boolean"
+                },
+                "total_cents": {
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "github_com_Sawalhy_backend-golang-task-2025_internal_services.PaymentAttempt": {
+            "type": "object",
+            "properties": {
+                "attempts": {
+                    "type": "integer"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "status": {
+                    "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.PaymentStatus"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_api_handlers.ErrorResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "trace_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Order": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order"
+                    }
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
+        "internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Product": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Product"
+                    }
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
+        "internal_api_handlers.createOrderRequest": {
+            "type": "object",
+            "required": [
+                "items"
+            ],
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "minItems": 1,
+                    "items": {
+                        "$ref": "#/definitions/internal_api_handlers.orderLineRequest"
+                    }
+                }
+            }
+        },
+        "internal_api_handlers.createProductRequest": {
+            "type": "object",
+            "required": [
+                "name",
+                "price_cents",
+                "sku"
+            ],
+            "properties": {
+                "currency": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string",
+                    "maxLength": 2000
+                },
+                "name": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "minLength": 1
+                },
+                "price_cents": {
+                    "description": "Money crosses the wire as integer cents, the same as it is stored. A JSON\nfloat here would reintroduce the rounding the schema exists to avoid.",
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "sku": {
+                    "type": "string",
+                    "maxLength": 64,
+                    "minLength": 1
+                },
+                "stock": {
+                    "type": "integer",
+                    "minimum": 0
+                }
+            }
+        },
+        "internal_api_handlers.createUserRequest": {
+            "type": "object",
+            "required": [
+                "email",
+                "name",
+                "password"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "minLength": 1
+                },
+                "password": {
+                    "type": "string",
+                    "maxLength": 72,
+                    "minLength": 8
+                },
+                "role": {
+                    "description": "Role is accepted only when the caller is already an admin; see below.",
+                    "type": "string",
+                    "enum": [
+                        "CUSTOMER",
+                        "ADMIN"
+                    ]
+                }
+            }
+        },
+        "internal_api_handlers.loginRequest": {
+            "type": "object",
+            "required": [
+                "email",
+                "password"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "password": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_api_handlers.loginResponse": {
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string"
+                },
+                "user": {
+                    "$ref": "#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.User"
+                }
+            }
+        },
+        "internal_api_handlers.orderLineRequest": {
+            "type": "object",
+            "required": [
+                "product_id",
+                "qty"
+            ],
+            "properties": {
+                "product_id": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "qty": {
+                    "type": "integer",
+                    "minimum": 1
+                }
+            }
+        },
+        "internal_api_handlers.restockRequest": {
+            "type": "object",
+            "properties": {
+                "available": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "version": {
+                    "description": "Version is the optimistic lock. Two admins restocking at once would\notherwise silently overwrite each other's absolute value.",
+                    "type": "integer"
+                }
+            }
+        },
+        "internal_api_handlers.updateOrderStatusRequest": {
+            "type": "object",
+            "required": [
+                "status"
+            ],
+            "properties": {
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_api_handlers.updateProductRequest": {
+            "type": "object",
+            "required": [
+                "active",
+                "name"
+            ],
+            "properties": {
+                "active": {
+                    "type": "boolean"
+                },
+                "description": {
+                    "type": "string",
+                    "maxLength": 2000
+                },
+                "name": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "minLength": 1
+                },
+                "price_cents": {
+                    "type": "integer",
+                    "minimum": 0
+                }
+            }
+        },
+        "internal_api_handlers.updateUserRequest": {
+            "type": "object",
+            "required": [
+                "email",
+                "name"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "minLength": 1
+                }
+            }
+        }
+    },
+    "securityDefinitions": {
+        "BearerAuth": {
+            "description": "Paste the token from POST /auth/login as: Bearer \u003ctoken\u003e",
+            "type": "apiKey",
+            "name": "Authorization",
+            "in": "header"
+        }
+    }
+}

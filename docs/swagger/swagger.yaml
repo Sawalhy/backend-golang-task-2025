@@ -1,0 +1,1006 @@
+basePath: /api/v1
+definitions:
+  github_com_Sawalhy_backend-golang-task-2025_internal_models.Inventory:
+    properties:
+      available:
+        type: integer
+      product_id:
+        type: integer
+      reserved:
+        type: integer
+      updated_at:
+        type: string
+      version:
+        type: integer
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_models.Order:
+    properties:
+      cancelled_at:
+        type: string
+      created_at:
+        type: string
+      currency:
+        type: string
+      id:
+        type: integer
+      items:
+        items:
+          $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderItem'
+        type: array
+      paid_at:
+        type: string
+      status:
+        $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderStatus'
+      total_cents:
+        type: integer
+      updated_at:
+        type: string
+      user_id:
+        type: integer
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderItem:
+    properties:
+      id:
+        type: integer
+      order_id:
+        type: integer
+      product_id:
+        type: integer
+      qty:
+        type: integer
+      unit_price_cents:
+        description: |-
+          UnitPriceCents is a snapshot taken at order time. If this were a join to
+          products.price, an admin raising a price would retroactively rewrite every
+          historical order and every past report.
+        type: integer
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderStatus:
+    enum:
+    - PENDING
+    - CHARGING
+    - PAID
+    - FAILED
+    - CANCELLING
+    - CANCELLED
+    - CANCELLED_REFUNDED
+    - EXPIRED
+    - FULFILLED
+    - REFUNDED
+    type: string
+    x-enum-varnames:
+    - OrderPending
+    - OrderCharging
+    - OrderPaid
+    - OrderFailed
+    - OrderCancelling
+    - OrderCancelled
+    - OrderCancelledRefunded
+    - OrderExpired
+    - OrderFulfilled
+    - OrderRefunded
+  github_com_Sawalhy_backend-golang-task-2025_internal_models.PaymentStatus:
+    enum:
+    - INITIATED
+    - SUCCEEDED
+    - DECLINED
+    - UNKNOWN
+    - REFUNDED
+    type: string
+    x-enum-varnames:
+    - PaymentInitiated
+    - PaymentSucceeded
+    - PaymentDeclined
+    - PaymentUnknown
+    - PaymentRefunded
+  github_com_Sawalhy_backend-golang-task-2025_internal_models.Product:
+    properties:
+      active:
+        type: boolean
+      created_at:
+        type: string
+      currency:
+        type: string
+      description:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      price_cents:
+        type: integer
+      sku:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_models.User:
+    properties:
+      created_at:
+        type: string
+      email:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      role:
+        $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.UserRole'
+      updated_at:
+        type: string
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_models.UserRole:
+    enum:
+    - CUSTOMER
+    - ADMIN
+    type: string
+    x-enum-varnames:
+    - RoleCustomer
+    - RoleAdmin
+  github_com_Sawalhy_backend-golang-task-2025_internal_repository.DailyRow:
+    properties:
+      currency:
+        type: string
+      day:
+        type: string
+      gross_cents:
+        type: integer
+      orders_count:
+        type: integer
+      source:
+        description: |-
+          Source makes the two halves of the report distinguishable rather than
+          silently blended: a closed day is a materialised fact, today is a moving
+          number that will change before the day ends.
+        type: string
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_repository.InventoryWithProduct:
+    properties:
+      available:
+        type: integer
+      name:
+        type: string
+      product_id:
+        type: integer
+      reserved:
+        type: integer
+      sku:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_services.CancelResult:
+    properties:
+      order:
+        $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order'
+      pending:
+        description: true when a charge is in flight and the outcome is not yet known
+        type: boolean
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_services.OrderStatusView:
+    properties:
+      cancelled_at:
+        type: string
+      currency:
+        type: string
+      order_id:
+        type: integer
+      paid_at:
+        type: string
+      payment_attempts:
+        items:
+          $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_services.PaymentAttempt'
+        type: array
+      status:
+        $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.OrderStatus'
+      terminal:
+        type: boolean
+      total_cents:
+        type: integer
+      updated_at:
+        type: string
+    type: object
+  github_com_Sawalhy_backend-golang-task-2025_internal_services.PaymentAttempt:
+    properties:
+      attempts:
+        type: integer
+      id:
+        type: string
+      status:
+        $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.PaymentStatus'
+      updated_at:
+        type: string
+    type: object
+  internal_api_handlers.ErrorResponse:
+    properties:
+      error:
+        type: string
+      trace_id:
+        type: string
+    type: object
+  internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Order:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order'
+        type: array
+      limit:
+        type: integer
+      offset:
+        type: integer
+      total:
+        type: integer
+    type: object
+  internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Product:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Product'
+        type: array
+      limit:
+        type: integer
+      offset:
+        type: integer
+      total:
+        type: integer
+    type: object
+  internal_api_handlers.createOrderRequest:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/internal_api_handlers.orderLineRequest'
+        maxItems: 50
+        minItems: 1
+        type: array
+    required:
+    - items
+    type: object
+  internal_api_handlers.createProductRequest:
+    properties:
+      currency:
+        type: string
+      description:
+        maxLength: 2000
+        type: string
+      name:
+        maxLength: 200
+        minLength: 1
+        type: string
+      price_cents:
+        description: |-
+          Money crosses the wire as integer cents, the same as it is stored. A JSON
+          float here would reintroduce the rounding the schema exists to avoid.
+        minimum: 0
+        type: integer
+      sku:
+        maxLength: 64
+        minLength: 1
+        type: string
+      stock:
+        minimum: 0
+        type: integer
+    required:
+    - name
+    - price_cents
+    - sku
+    type: object
+  internal_api_handlers.createUserRequest:
+    properties:
+      email:
+        type: string
+      name:
+        maxLength: 200
+        minLength: 1
+        type: string
+      password:
+        maxLength: 72
+        minLength: 8
+        type: string
+      role:
+        description: Role is accepted only when the caller is already an admin; see
+          below.
+        enum:
+        - CUSTOMER
+        - ADMIN
+        type: string
+    required:
+    - email
+    - name
+    - password
+    type: object
+  internal_api_handlers.loginRequest:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  internal_api_handlers.loginResponse:
+    properties:
+      token:
+        type: string
+      user:
+        $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.User'
+    type: object
+  internal_api_handlers.orderLineRequest:
+    properties:
+      product_id:
+        minimum: 1
+        type: integer
+      qty:
+        minimum: 1
+        type: integer
+    required:
+    - product_id
+    - qty
+    type: object
+  internal_api_handlers.restockRequest:
+    properties:
+      available:
+        minimum: 0
+        type: integer
+      version:
+        description: |-
+          Version is the optimistic lock. Two admins restocking at once would
+          otherwise silently overwrite each other's absolute value.
+        type: integer
+    type: object
+  internal_api_handlers.updateOrderStatusRequest:
+    properties:
+      status:
+        type: string
+    required:
+    - status
+    type: object
+  internal_api_handlers.updateProductRequest:
+    properties:
+      active:
+        type: boolean
+      description:
+        maxLength: 2000
+        type: string
+      name:
+        maxLength: 200
+        minLength: 1
+        type: string
+      price_cents:
+        minimum: 0
+        type: integer
+    required:
+    - active
+    - name
+    type: object
+  internal_api_handlers.updateUserRequest:
+    properties:
+      email:
+        type: string
+      name:
+        maxLength: 200
+        minLength: 1
+        type: string
+    required:
+    - email
+    - name
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: |-
+    Order processing with reserve-pay-commit inventory, an outbox
+    relay, and compare-and-swap state transitions throughout.
+
+    POST /orders returns 202, not 201: when it returns, stock is
+    reserved and the order exists, but payment has not happened yet.
+    Poll GET /orders/{id}/status for the outcome.
+  title: Concurrent Order Processing API
+  version: "1.0"
+paths:
+  /admin/inventory/{id}:
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: product id
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: stock
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handlers.restockRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Inventory'
+        "400":
+          description: 409 = version conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "403":
+          description: 409 = version conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "404":
+          description: 409 = version conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "409":
+          description: 409 = version conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Set absolute stock level
+      tags:
+      - admin
+  /admin/inventory/low-stock:
+    get:
+      parameters:
+      - description: alert at or below this level (default 10)
+        in: query
+        name: threshold
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_repository.InventoryWithProduct'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Low stock alerts
+      tags:
+      - admin
+  /admin/orders:
+    get:
+      parameters:
+      - description: filter by status
+        in: query
+        name: status
+        type: string
+      - description: page size
+        in: query
+        name: limit
+        type: integer
+      - description: offset
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Order'
+      security:
+      - BearerAuth: []
+      summary: List all orders
+      tags:
+      - admin
+  /admin/orders/{id}/status:
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: order id
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: target status
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handlers.updateOrderStatusRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Update an order's status
+      tags:
+      - admin
+  /admin/reports/daily:
+    get:
+      parameters:
+      - description: inclusive start date, YYYY-MM-DD (UTC)
+        in: query
+        name: from
+        type: string
+      - description: exclusive end date, YYYY-MM-DD (UTC)
+        in: query
+        name: to
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_repository.DailyRow'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Daily sales report
+      tags:
+      - admin
+  /auth/login:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: credentials
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handlers.loginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_api_handlers.loginResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      summary: Log in and receive a JWT
+      tags:
+      - auth
+  /orders:
+    get:
+      parameters:
+      - description: page size
+        in: query
+        name: limit
+        type: integer
+      - description: offset
+        in: query
+        name: offset
+        type: integer
+      - description: filter by status
+        in: query
+        name: status
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Order'
+      security:
+      - BearerAuth: []
+      summary: List your orders
+      tags:
+      - orders
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: client retry key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: order
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handlers.createOrderRequest'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order'
+        "400":
+          description: 409 = insufficient stock
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "401":
+          description: 409 = insufficient stock
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "409":
+          description: 409 = insufficient stock
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Place an order
+      tags:
+      - orders
+  /orders/{id}:
+    get:
+      parameters:
+      - description: order id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Order'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Get an order
+      tags:
+      - orders
+  /orders/{id}/cancel:
+    put:
+      parameters:
+      - description: order id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: cancelled
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_services.CancelResult'
+        "202":
+          description: cancellation pending payment outcome
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_services.CancelResult'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Cancel an order
+      tags:
+      - orders
+  /orders/{id}/events:
+    get:
+      description: Emits an initial `status` event with current state, then one event
+        per transition. Terminates when the order reaches a terminal state.
+      parameters:
+      - description: order id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - text/event-stream
+      responses:
+        "200":
+          description: event stream
+          schema:
+            type: string
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Stream order status changes (SSE)
+      tags:
+      - orders
+  /orders/{id}/status:
+    get:
+      parameters:
+      - description: order id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_services.OrderStatusView'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Get order status and payment attempts
+      tags:
+      - orders
+  /products:
+    get:
+      parameters:
+      - description: page size (max 100)
+        in: query
+        name: limit
+        type: integer
+      - description: offset
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_api_handlers.PageResponse-github_com_Sawalhy_backend-golang-task-2025_internal_models_Product'
+      summary: List products
+      tags:
+      - products
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: product
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handlers.createProductRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Product'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Create a product
+      tags:
+      - products
+  /products/{id}:
+    get:
+      parameters:
+      - description: product id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Product'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      summary: Get product details
+      tags:
+      - products
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: product id
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: product
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handlers.updateProductRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Product'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Update a product
+      tags:
+      - products
+  /products/{id}/inventory:
+    get:
+      parameters:
+      - description: product id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.Inventory'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      summary: Check inventory for a product
+      tags:
+      - products
+  /users:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: user
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handlers.createUserRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.User'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      summary: Register a user
+      tags:
+      - users
+  /users/{id}:
+    get:
+      parameters:
+      - description: user id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.User'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Get a user profile
+      tags:
+      - users
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: user id
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: profile
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handlers.updateUserRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Sawalhy_backend-golang-task-2025_internal_models.User'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/internal_api_handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Update a user profile
+      tags:
+      - users
+securityDefinitions:
+  BearerAuth:
+    description: 'Paste the token from POST /auth/login as: Bearer <token>'
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"
