@@ -33,19 +33,52 @@ plus the rate limiter), and pure unit tests where no infrastructure is needed.
 
 ## 1. How the suite is built
 
-### Real Postgres, never a mock
-
-Nothing here mocks the database, and that is the central decision.
+### Real Postgres for anything concurrent
 
 **A mock returns what you told it to return.** It is structurally incapable of
 exhibiting a race: it cannot lose an update, cannot deadlock, cannot enforce a
 `CHECK` constraint, and cannot make two transactions contend for a row. Every
-interesting bug in this system is a database race, so a mock-based suite would
-pass while the system overselling stock.
+interesting bug in this system is a database race, so an oversell test written
+against a mocked repository passes trivially and proves nothing.
 
 The tests therefore run the **real migration files** rather than `AutoMigrate`,
 because the `CHECK` constraints and partial unique indexes *are* the invariants
 under test. A schema built any other way would be testing a different system.
+
+**That argument is about concurrency, and it does not extend to everything.**
+Asserting *"what happens when the database returns an error"* needs an injected
+error, not a real race — so "no mocks anywhere" would be the right conclusion
+drawn from the wrong premise.
+
+The suite is not anti-mock. It is **selectively seamed**, and the line is worth
+stating plainly, because it is a design decision rather than an accident:
+
+| Dependency | Seam | Why |
+|---|---|---|
+| `PaymentProvider` | interface | We do not own a card network and cannot run one |
+| `Notifier` | interface | Same, for email and SMS |
+| `*repository.Store` | concrete | We own Postgres and can run it in Docker in seconds |
+| `*redis.Client` | concrete | Same |
+
+Both interfaces are mocked heavily — `scriptedProvider` counts *distinct charges*
+and can hold one mid-flight; `countingNotifier` counts sends and can be made to
+fail. So test doubles are used wherever there is a port to substitute.
+
+**Why the data layer has no seam.** Constructor injection is not the same as
+substitutability: every service takes `*repository.Store`, a concrete struct, so
+there is nothing to swap. Adding consumer-side interfaces would be cheap in Go
+(each service declares only the handful of methods it calls, not all 66) — the
+cost is not typing.
+
+The cost is that the seam is a trap. Once `*repository.Store` is an interface,
+the oversell test *can* be written against a mock, and it will pass. That is a
+loaded gun left for whoever maintains this next, traded for coverage of branches
+that are almost entirely `if err != nil { return fmt.Errorf("...: %w", err) }`,
+where the assertion is that Go propagates errors.
+
+**If those branches are wanted, fault injection is the better tool** — see §12.1.
+Because we own Postgres in tests we can make it genuinely fail, which exercises
+the same branches with real semantics and without opening the seam.
 
 ### Getting a database
 
@@ -614,14 +647,31 @@ cost, because "untested" without a reason is just an apology.
 mid-transaction: a dropped connection, a full disk, a cancelled context at an
 awkward moment.
 
-Reaching them needs a proxy that can fail queries on command, or interface seams
-introduced purely so a mock can return errors — which would mean mocking the
-database, the one thing this suite deliberately refuses to do.
+There are two ways to reach them, and they are not equally good.
 
-**This is the bucket I would leave alone.** The branches are one line each and
-uniform; the risk they carry is low, and the machinery to reach them would cost
-more clarity than it buys confidence. Coverage percentage is the wrong reason to
-add it.
+**Interface seams and a mock.** Add consumer-side interfaces for the repositories
+and substitute a double that returns errors. Cheap to write — but it opens the
+seam that lets someone write the oversell test against a mock, where it passes
+trivially. See §1 for why that trade is bad.
+
+**Fault injection into the real database.** Better, because it needs no
+production change at all and produces a *real* failure rather than a fake one:
+
+| Technique | Reaches |
+|---|---|
+| A GORM plugin that errors on the Nth query | Any specific statement in a sequence — a seam at the driver, not the architecture |
+| `SET statement_timeout = '1ms'` | Genuine query timeouts, with real cancellation semantics |
+| `pg_terminate_backend` mid-transaction | Rollback under a connection that actually died |
+| toxiproxy in front of Postgres | Latency, partial writes, connection resets |
+
+`pg_terminate_backend` is the interesting one: it tests rollback with the exact
+semantics production would see, rather than an error a test author invented.
+
+**Even so, this is the bucket I would leave for last.** The branches are one line
+each and uniform, the risk they carry is low, and coverage percentage is the
+wrong reason to build the machinery. But if the goal is confidence rather than a
+number — specifically, confidence that a mid-transaction failure rolls back
+cleanly — the fault-injection route is worth it and the mocking route is not.
 
 ### 12.2 What a real `SIGKILL` would still add
 
