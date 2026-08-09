@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/models"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/repository"
@@ -130,42 +129,6 @@ func (s *CatalogService) Restock(ctx context.Context, productID uint64, availabl
 	return s.store.Inventory().SetAvailable(ctx, nil, productID, available, expectedVersion)
 }
 
-// --- reports ---------------------------------------------------------------
-
-type DailyReport struct {
-	Day         string `json:"day"`
-	OrdersCount int    `json:"orders_count"`
-	GrossCents  int64  `json:"gross_cents"`
-	Currency    string `json:"currency"`
-}
-
-// DailySales answers GET /admin/reports/daily.
-//
-// The aggregation runs in Postgres rather than by pulling rows into Go and
-// summing them. That is not a micro-optimisation: streaming a day of orders into
-// the application to add up a column moves megabytes over the wire to produce one
-// number, and it is the report path that stalls order processing.
-//
-// "Daily" is computed in UTC. The spec does not say which timezone it means
-// (DESIGN_NOTES.md §5.17), so the boundary is stated rather than guessed — a
-// report that silently uses server-local time is wrong twice a year.
-func (s *CatalogService) DailySales(ctx context.Context, from, to time.Time) ([]DailyReport, error) {
-	var out []DailyReport
-
-	// The predicate matches the partial index orders_report_range
-	// (created_at) WHERE status IN ('PAID','FULFILLED').
-	err := s.store.DB().WithContext(ctx).Raw(`
-		SELECT to_char(date_trunc('day', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
-		       count(*)                AS orders_count,
-		       COALESCE(sum(total_cents), 0) AS gross_cents,
-		       max(currency)           AS currency
-		  FROM orders
-		 WHERE status IN ('PAID','FULFILLED')
-		   AND created_at >= ? AND created_at < ?
-		 GROUP BY 1
-		 ORDER BY 1 DESC`, from, to).Scan(&out).Error
-	if err != nil {
-		return nil, fmt.Errorf("building daily sales report: %w", err)
-	}
-	return out, nil
-}
+// The daily sales report lives in ReportService: it is served from two sources
+// (the materialised rollup for closed days, live aggregation for today) and has
+// its own scheduled job, which is more than a catalogue concern.

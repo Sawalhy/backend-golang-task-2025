@@ -16,10 +16,11 @@ import (
 type AdminHandler struct {
 	orders  *services.OrderService
 	catalog *services.CatalogService
+	reports *services.ReportService
 }
 
-func NewAdminHandler(orders *services.OrderService, catalog *services.CatalogService) *AdminHandler {
-	return &AdminHandler{orders: orders, catalog: catalog}
+func NewAdminHandler(orders *services.OrderService, catalog *services.CatalogService, reports *services.ReportService) *AdminHandler {
+	return &AdminHandler{orders: orders, catalog: catalog, reports: reports}
 }
 
 // ListOrders handles GET /api/v1/admin/orders — every user's orders.
@@ -121,12 +122,16 @@ func (h *AdminHandler) UpdateOrderStatus(c *gin.Context) {
 // a column is how report generation starves order processing — the aggregation
 // belongs where the data already is.
 //
+// Closed days are served from the materialised rollup; today is aggregated live,
+// because it is still changing. Each row carries its `source` so the two are
+// distinguishable rather than silently blended.
+//
 //	@Summary	Daily sales report
 //	@Tags		admin
 //	@Produce	json
 //	@Param		from	query		string	false	"inclusive start date, YYYY-MM-DD (UTC)"
 //	@Param		to		query		string	false	"exclusive end date, YYYY-MM-DD (UTC)"
-//	@Success	200		{array}		services.DailyReport
+//	@Success	200		{array}		repository.DailyRow
 //	@Security	BearerAuth
 //	@Router		/admin/reports/daily [get]
 func (h *AdminHandler) DailyReport(c *gin.Context) {
@@ -152,7 +157,7 @@ func (h *AdminHandler) DailyReport(c *gin.Context) {
 		to = t.UTC()
 	}
 
-	rows, err := h.catalog.DailySales(c.Request.Context(), from, to)
+	rows, err := h.reports.DailySales(c.Request.Context(), from, to)
 	if err != nil {
 		fail(c, err)
 		return
