@@ -78,6 +78,10 @@ func fail(c *gin.Context, err error) {
 	c.AbortWithStatusJSON(status, ErrorResponse{Error: msg, TraceID: traceID})
 }
 
+// ErrStreamingUnsupported means the ResponseWriter cannot flush, so an SSE
+// stream would be buffered until the handler returned — which is not a stream.
+var ErrStreamingUnsupported = errors.New("streaming unsupported by this connection")
+
 // wrapBinding turns a Gin binding/validator failure into ErrInvalidInput, so it
 // flows through the same statusFor mapping as every other error and comes back
 // as 400 with the validator's own explanation of which field was wrong.

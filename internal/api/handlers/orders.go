@@ -13,10 +13,11 @@ import (
 
 type OrderHandler struct {
 	orders *services.OrderService
+	hub    *services.StatusHub
 }
 
-func NewOrderHandler(orders *services.OrderService) *OrderHandler {
-	return &OrderHandler{orders: orders}
+func NewOrderHandler(orders *services.OrderService, hub *services.StatusHub) *OrderHandler {
+	return &OrderHandler{orders: orders, hub: hub}
 }
 
 type orderLineRequest struct {

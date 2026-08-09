@@ -7,7 +7,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
+	swaggerfiles "github.com/swaggo/files"
+	ginswagger "github.com/swaggo/gin-swagger"
 
+	// Registers the generated OpenAPI spec with swag's global registry. Blank
+	// import because nothing calls into it — importing it IS the registration.
+	// Regenerate after changing any annotation:
+	//   scripts/go.ps1 run github.com/swaggo/swag/cmd/swag@latest init \
+	//       -g cmd/api/main.go -o docs/swagger --parseDependency --parseInternal
+	_ "github.com/Sawalhy/backend-golang-task-2025/docs/swagger"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/api/handlers"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/api/middleware"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/config"
@@ -20,8 +28,11 @@ type Deps struct {
 	Auth    *services.AuthService
 	Orders  *services.OrderService
 	Catalog *services.CatalogService
-	Redis   *redis.Client
-	Health  func() error
+	Reports *services.ReportService
+	// Hub fans broker events out to this instance's SSE connections.
+	Hub    *services.StatusHub
+	Redis  *redis.Client
+	Health func() error
 }
 
 // Build returns the configured engine.
@@ -71,12 +82,27 @@ func Build(d Deps) *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
+	// Swagger UI at /swagger/index.html.
+	//
+	// Served in development only. In production it publishes a complete map of
+	// the API — every route, every field, every validation rule — to anyone who
+	// asks, which is free reconnaissance. Ship the spec file to whoever needs it
+	// instead of hosting it next to the thing it describes.
+	if !d.Cfg.IsProduction() {
+		r.GET("/swagger/*any", ginswagger.WrapHandler(swaggerfiles.Handler))
+		// Convenience redirect: /swagger alone 404s otherwise, which reads as
+		// "not wired up" rather than "wrong path".
+		r.GET("/docs", func(c *gin.Context) {
+			c.Redirect(http.StatusMovedPermanently, "/swagger/index.html")
+		})
+	}
+
 	v1 := r.Group("/api/v1")
 
 	authH := handlers.NewAuthHandler(d.Auth)
 	productH := handlers.NewProductHandler(d.Catalog)
-	orderH := handlers.NewOrderHandler(d.Orders)
-	adminH := handlers.NewAdminHandler(d.Orders, d.Catalog)
+	orderH := handlers.NewOrderHandler(d.Orders, d.Hub)
+	adminH := handlers.NewAdminHandler(d.Orders, d.Catalog, d.Reports)
 
 	// --- public --------------------------------------------------------------
 	// Rate limited by IP. Login especially: without a limit it is an offline
@@ -105,6 +131,18 @@ func Build(d Deps) *gin.Engine {
 		// PUT on a verb is not RESTful; the spec specifies it at README.md:86,
 		// so it is implemented as specified and noted in the README.
 		priv.PUT("/orders/:id/cancel", orderH.CancelOrder)
+	}
+
+	// --- streaming -----------------------------------------------------------
+	// Authenticated but NOT rate limited. The token bucket charges one token per
+	// request, and an SSE connection is a single request that stays open for
+	// minutes — so a client reconnecting after a few drops would be throttled
+	// for behaving exactly as intended. Long-lived connections want a
+	// concurrent-connection cap, which is a different mechanism.
+	stream := v1.Group("")
+	stream.Use(auth)
+	{
+		stream.GET("/orders/:id/events", orderH.StreamOrderStatus)
 	}
 
 	// --- admin ---------------------------------------------------------------
