@@ -2153,6 +2153,55 @@ What the `attempts` column is for, and it needs saying:
 
 The consumer-side dead-letter idea, applied to the producer side.
 
+### 5.20 Topic 10 — the WAL, and why CDC is "the outbox you already have"
+
+*2026-08-09.*
+
+**The problem.** `COMMIT` must survive power loss one microsecond later, but the changed rows are
+dirty pages in memory whose real homes are scattered — this table's page 4,102, that index's page
+88,301. Writing them in place is **random I/O across the whole disk**, far too slow to do inside
+every commit.
+
+**The trick.** You don't have to write the *data* — only enough information to **redo** it, and that
+can be appended to a single file sequentially. Before `COMMIT` returns, Postgres appends a record
+(*"txn 4471 changed page X of relation Y thus"*) and `fsync`s it. One sequential append; many
+concurrent commits batch into the same write. Real pages are written later by the background writer
+and at checkpoints; a crash in between is repaired by replaying the WAL from the last checkpoint.
+
+The name is the rule: **write-ahead** — the log record is durable *before* the page it describes.
+
+**What falls out.** Postgres now owns a complete, ordered record of every change ever made. Built for
+crash recovery, but once it exists:
+
+| Feature | Is just |
+|---|---|
+| Streaming replication | a replica replaying the primary's WAL — the answer to `README.md:274` on failover |
+| Point-in-time recovery | base backup + replay to a chosen moment |
+| **CDC / Debezium** | **reading the WAL as an event stream** |
+
+> **Pattern ③ isn't "instead of an outbox." It's "the outbox already exists — it's called the WAL."**
+
+Postgres exposes it via **logical replication slots**; a decoder (`pgoutput`, `wal2json`) turns
+physical WAL into row-level logical changes and Debezium republishes them. The application writes
+nothing but its normal data and events appear.
+
+**Why we didn't take it:**
+
+- Your **table schema becomes your public event contract** — rename a column, break every consumer.
+- Heavy infrastructure: Debezium is Kafka Connect, which means running Kafka.
+- **Replication slots are operationally sharp.** A dead or lagging consumer pins WAL on the primary,
+  it is never recycled, the disk fills, the database stops. A well-known way to lose production.
+- **The WAL records what *changed*; the outbox records what *happened*.** `orders.status:
+  PENDING → PAID` is a physical fact; `order.paid` is a business event with a chosen shape. CDC hands
+  you the former and makes every consumer reconstruct the latter.
+
+**The hybrid, arguably state of the art:** keep writing outbox rows for the designed event shape, but
+let Debezium publish them from the WAL rather than a polling relay. Deliberate events, no dual write,
+no polling — and more moving parts than this project justifies.
+
+**Loose end tied off:** *every index adds WAL volume*, since every index change is a logged change.
+That is the concrete cost behind §5.18's decision to leave `inventory.available` unindexed.
+
 ---
 
 ## 6. Roadmap — remaining discussions
@@ -2169,7 +2218,10 @@ The consumer-side dead-letter idea, applied to the producer side.
 | 7 | Schema and indexing strategy | — | ✅ done (§5.18) |
 | 8 | Testing — unit, integration, concurrency, load | — | **skipped as a discussion 2026-08-09.** Tests still get written at build-order step 7 — the concurrency tests are the only evidence the graded core works |
 | 9 | Observability — metrics, structured logging, distributed tracing | — | ✅ done (§5.19) |
-| **10** | **The WAL, and how CDC relates to the outbox** | — | **← last one** |
+| 10 | The WAL, and how CDC relates to the outbox | — | ✅ done (§5.20) |
+
+**All ten topics closed.** Remaining before code: the five Go tells (§9.1), which are graded
+directly. Everything else is implementation, sequenced in `docs/IMPLEMENTATION.md` §8.
 
 **Sequencing decision (2026-08-09).** Topics 8–10 do not block implementation and can follow it. Two
 things must nonetheless be right from the first commit, because retrofitting them is expensive:
@@ -2238,9 +2290,7 @@ still completes.
 1. **The five non-native-Go tells** — goroutine leaks, channels where a mutex belonged, unthreaded
    `context.Context`, unclosed `rows`, Java-shaped packages. Shelved 2026-08-09; now graded directly
    by `README.md:216`, so deliver before implementation.
-2. **The WAL, and how CDC relates to the outbox** — what Postgres's write-ahead log actually is, why
-   it exists, and how pattern ③ (Debezium) reads it instead of an outbox table. Referenced in §5.6
-   and §5.12, never explained.
+2. ~~The WAL and CDC~~ — ✅ delivered, §5.20.
 3. **Hands-on reading on the observability tools** *(added 2026-08-09 at Ahmed's request)* —
    Prometheus, Grafana, OpenTelemetry, Jaeger. He has never used any of them. §5.19 covers the
    concepts and what to measure; this is the practical follow-up.
