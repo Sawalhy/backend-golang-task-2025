@@ -91,7 +91,7 @@ func run() error {
 	// is indistinguishable from an idle one. Supervise ends the session and
 	// redials; unacked messages are redelivered by the broker.
 	g.Go(func() error {
-		return workers.Supervise(gctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, log,
+		return workers.Supervise(gctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, "worker", log,
 			func(sessionCtx context.Context, broker *workers.Broker) error {
 				cg, cctx := errgroup.WithContext(sessionCtx)
 

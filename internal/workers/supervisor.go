@@ -43,7 +43,7 @@ func (b *Broker) NotifyClose() chan *amqp.Error {
 // Backoff is capped and jittered. Without jitter, every service reconnects in
 // lockstep the moment the broker returns and knocks it straight over again —
 // the same thundering-herd problem the deadlock retry avoids.
-func Supervise(ctx context.Context, url, exchange string, log *slog.Logger, run func(ctx context.Context, b *Broker) error) error {
+func Supervise(ctx context.Context, url, exchange, name string, log *slog.Logger, run func(ctx context.Context, b *Broker) error) error {
 	const (
 		minBackoff = 500 * time.Millisecond
 		maxBackoff = 30 * time.Second
@@ -55,7 +55,7 @@ func Supervise(ctx context.Context, url, exchange string, log *slog.Logger, run 
 			return nil
 		}
 
-		broker, err := Connect(url, exchange, log)
+		broker, err := Connect(url, exchange, name, log)
 		if err != nil {
 			log.Error("cannot reach broker, retrying", "error", err, "retry_in", backoff)
 			if !sleepCtx(ctx, backoff) {

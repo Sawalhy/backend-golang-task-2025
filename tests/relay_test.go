@@ -22,7 +22,7 @@ func newRelayFixture(t *testing.T) (*repository.Store, *gorm.DB, *workers.Relay,
 	store, db := newStore(t)
 	log := logger.New("error", false)
 
-	broker, err := workers.Connect(url, "orders", log)
+	broker, err := workers.Connect(url, "orders", "test", log)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = broker.Close() })
 	require.NoError(t, broker.DeclareTopology())
@@ -127,7 +127,7 @@ func TestTwoRelaysDoNotDoublePublish(t *testing.T) {
 
 	url := requireBroker(t)
 	log := logger.New("error", false)
-	brokerB, err := workers.Connect(url, "orders", log)
+	brokerB, err := workers.Connect(url, "orders", "test", log)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = brokerB.Close() })
 	pubB, err := brokerB.NewPublisher()

@@ -46,8 +46,24 @@ type Broker struct {
 	log      *slog.Logger
 }
 
-func Connect(url, exchange string, log *slog.Logger) (*Broker, error) {
-	conn, err := amqp.Dial(url)
+// Connect dials the broker under a given name.
+//
+// The name is not decoration. RabbitMQ's management UI lists connections by
+// host:port otherwise, so during an incident you are looking at a wall of
+// identical rows with no way to tell the relay from a worker from an API
+// replica. Naming them makes "which process is holding these 400 unacked
+// messages?" answerable.
+//
+// Heartbeat and Locale have to be set explicitly: amqp.Dial supplies defaults
+// for them, but DialConfig does not, and a zero heartbeat disables dead-peer
+// detection entirely — which is precisely the failure this package exists to
+// survive.
+func Connect(url, exchange, name string, log *slog.Logger) (*Broker, error) {
+	conn, err := amqp.DialConfig(url, amqp.Config{
+		Heartbeat:  10 * time.Second,
+		Locale:     "en_US",
+		Properties: amqp.Table{"connection_name": name},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("dialling rabbitmq: %w", err)
 	}

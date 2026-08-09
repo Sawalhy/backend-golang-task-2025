@@ -67,7 +67,7 @@ func run() error {
 	// the restart: unpublished rows still have sent_at IS NULL, so the next
 	// session claims exactly the same batch.
 	g.Go(func() error {
-		return workers.Supervise(gctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, log,
+		return workers.Supervise(gctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, "relay", log,
 			func(sessionCtx context.Context, broker *workers.Broker) error {
 				pub, err := broker.NewPublisher()
 				if err != nil {

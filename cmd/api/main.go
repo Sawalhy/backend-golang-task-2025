@@ -182,7 +182,7 @@ func run() error {
 	// background instead of failing startup. It also exits when ctx is
 	// cancelled, giving the goroutine a guaranteed exit path.
 	go func() {
-		_ = workers.Supervise(ctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, log,
+		_ = workers.Supervise(ctx, cfg.Rabbit.URL, cfg.Rabbit.Exchange, "api-"+instanceID, log,
 			func(sessionCtx context.Context, broker *workers.Broker) error {
 				return workers.RunOrderEventBackplane(sessionCtx, broker, instanceID, hub.Publish, log)
 			})

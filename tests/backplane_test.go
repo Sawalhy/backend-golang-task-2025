@@ -82,7 +82,7 @@ func TestBackplaneDeliversOrderEventsToHub(t *testing.T) {
 	url := requireBroker(t)
 	log := logger.New("error", false)
 
-	broker, err := workers.Connect(url, "orders", log)
+	broker, err := workers.Connect(url, "orders", "test", log)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = broker.Close() })
 
@@ -124,7 +124,7 @@ func TestBackplaneQueuesDoNotCompete(t *testing.T) {
 	url := requireBroker(t)
 	log := logger.New("error", false)
 
-	broker, err := workers.Connect(url, "orders", log)
+	broker, err := workers.Connect(url, "orders", "test", log)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = broker.Close() })
 	require.NoError(t, broker.DeclareTopology())
@@ -170,7 +170,7 @@ func TestBackplaneBindingScopesToOrderEvents(t *testing.T) {
 	url := requireBroker(t)
 	log := logger.New("error", false)
 
-	broker, err := workers.Connect(url, "orders", log)
+	broker, err := workers.Connect(url, "orders", "test", log)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = broker.Close() })
 	require.NoError(t, broker.DeclareTopology())
