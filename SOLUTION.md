@@ -383,8 +383,16 @@ pointing it at `orders` would wipe the running stack.
 Integration tests run the real migration files, not `AutoMigrate`, because the
 CHECK constraints and partial unique indexes *are* the invariants under test.
 
-Current state: **32 passing** — 7 oversell/concurrency, 7 reaper, 7 rollup,
-4 SSE, 3 backplane, plus 7 hub unit tests (the hub set clean under `-race`).
+Current state: **47 passing** — 12 payment saga (failure modes C, D, E),
+7 oversell/concurrency, 7 reaper, 7 rollup, 4 SSE, 3 backplane, plus 7 hub unit
+tests (the hub set clean under `-race`).
+
+The saga tests cover what happens when things die. A cancel racing a live charge
+is a timing bug, so the fake provider has a **gate** that holds the charge
+mid-flight — that makes the race deterministic instead of hoping the scheduler
+interleaves two goroutines helpfully. It also counts *distinct charges*
+separately from *calls*, which is what lets a test assert "the card was charged
+exactly once" rather than merely "the code ran once".
 
 ### The tests were checked for teeth
 
@@ -422,10 +430,13 @@ database race, so a mock-based suite would pass while the system oversold stock.
 
 Stated plainly, because silence reads as unfinished.
 
-- **Payment saga tests** — the cancel-vs-charge race (failure mode D) and the
-  `UNKNOWN` reconciliation path are exercised by hand and by the running system,
-  but not yet by the suite. They are the most valuable remaining tests, and the
-  harness makes them straightforward.
+- **Regression test for the broker reconnect.** The wedged-relay bug below is
+  fixed and verified by hand (`docker compose restart rabbitmq`, watching both
+  services redial), but nothing in the suite would catch a regression. It needs a
+  broker whose connection can be severed on demand — toxiproxy, or a
+  testcontainers RabbitMQ that can be stopped mid-session — then asserts the
+  relay redials, re-declares topology and drains the backlog. This is the most
+  valuable remaining test.
 - **Real-time inventory push** — order status streams; stock levels do not.
   Broadcasting every decrement to every browsing customer is a firehose that
   serves almost nobody, and the number is stale the instant it is rendered
@@ -436,6 +447,37 @@ Stated plainly, because silence reads as unfinished.
 - **No WebSockets, and no push for inventory.** Deliberate: a bidirectional
   protocol solves a problem order status does not have. This forfeits a bonus
   tick; the justification is worth more.
+
+## Two bugs the failure-mode tests found
+
+Writing tests for node death turned up two defects that reading the code did not.
+
+**A worker dying mid-charge stranded the order forever.** `ProcessOrder` skips
+any order that is not `PENDING`, so a process SIGKILLed between the
+`PENDING → CHARGING` transition and settlement left an order in `CHARGING` with
+an `INITIATED` intent that nothing could recover: redelivery skipped it (not
+`PENDING`), the reaper skipped it (only expires `PENDING`, and rightly so — a
+live charge may be in flight), and reconciliation skipped it (only looks at
+`UNKNOWN`). The order held its stock forever while the customer may already have
+been charged. The code comment even claimed "the retry finds this row" — but no
+retry ever came.
+
+Fixed with `RecoverStuckCharges`, a timer that re-drives abandoned intents **with
+the same idempotency key**, so the provider either replays the original result or
+performs the charge for the first time — never twice. That is precisely why the
+key lives on the `payments` row rather than being generated per call. The grace
+period must exceed the provider timeout, or the fix for E would reintroduce C by
+"recovering" a payment that is merely slow.
+
+**Reconciliation silently abandoned half its work.** `resolveUnknown` moved a
+payment out of `UNKNOWN`, then called `settleDecline`, which unconditionally
+CASed `INITIATED → DECLINED`. That CAS found the row already `DECLINED`, returned
+false, and returned early — so the *order* half never ran and the order stayed
+in `CHARGING` with its stock held. The success path worked only because
+`settleSuccess` happened to guard its CAS. Both paths now guard symmetrically.
+
+Both were caught by a test asserting the end state, not the call sequence —
+which is the argument for testing what the system *is* rather than what it *did*.
 
 ## A bug that only running it would find
 
