@@ -1,0 +1,55 @@
+# Autoscaling for the API only.
+#
+# `maxReplicas: 6` is not a capacity estimate, it is the connection budget in
+# api-deployment.yaml solved for replicas. Raising it without lowering
+# DB_MAX_OPEN_CONNS is how an HPA takes down a database it is not even part of:
+# the scale-up succeeds, the new pods each open their pool, and Postgres starts
+# refusing connections to everything including the pods that were already
+# working.
+#
+# There is deliberately no HPA for the worker or the relay:
+#
+#   - CPU is the wrong signal for the worker. It spends its time waiting on the
+#     payment provider, not computing, so CPU stays flat while the queue backs
+#     up — the metric would be quietest exactly when scaling is most needed. The
+#     right trigger is `payments` queue depth, which needs KEDA or the Prometheus
+#     adapter rather than the CPU metric this HPA uses. See ../README.md.
+#   - The relay does not benefit. Two instances drain the outbox as fast as one
+#     because the work is bounded by RELAY_INTERVAL and by Postgres, not by the
+#     relay; the second exists for availability, and SKIP LOCKED is what makes it
+#     safe (cmd/relay/main.go:5).
+#
+# Requires metrics-server. Without it the HPA reports <unknown> targets and
+# simply never scales, which is inert rather than harmful.
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Of the *request* (100m), not of a core. 70% leaves room to absorb a
+          # burst during the ~30s it takes a new pod to become ready.
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # React quickly, but not to a single spike.
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      # Five minutes of sustained quiet before giving a replica back. Scaling
+      # down eagerly means flapping, and every flap costs a pod start, a fresh
+      # connection pool and a dropped set of SSE streams.
+      stabilizationWindowSeconds: 300

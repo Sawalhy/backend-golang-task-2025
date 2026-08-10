@@ -1,0 +1,14 @@
+# A wider scaling range than the base, and a floor of 3 rather than 2 so that
+# losing a node still leaves two replicas rather than one.
+#
+# maxReplicas is not a guess at peak traffic. It is the connection budget in
+# ../kustomization.yaml solved for the API's share: 8 connections per pod against
+# a managed instance sized for 200 total. Raise it only together with that sum.
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  minReplicas: 3
+  maxReplicas: 8

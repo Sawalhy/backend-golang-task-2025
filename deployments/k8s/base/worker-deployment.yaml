@@ -1,0 +1,139 @@
+# Payment, refund and notification consumers, plus the periodic loops: the
+# reservation reaper, the notification lease sweep, stuck-charge recovery and the
+# sales rollup.
+#
+# A Deployment rather than a StatefulSet or a Job. There is no per-instance
+# identity to preserve — every worker is a competing consumer on the same durable
+# queues, so which one takes a message is irrelevant — and no completion, so
+# nothing here ever "finishes".
+#
+# --- Why there are no probes ------------------------------------------------
+#
+# No readiness probe: readiness gates Service endpoints, and nothing routes to a
+# worker. It consumes from RabbitMQ and polls Postgres; both are outbound.
+#
+# No liveness probe, and this is the more interesting one. The failure this
+# service actually has is not "the process died" — the kubelet already restarts
+# that. It is the wedge: an AMQP connection drops, every later publish returns
+# "channel/connection is not open", and the process stays alive and healthy while
+# doing nothing at all. It happened here, 241 consecutive failures before anyone
+# noticed (SOLUTION.md, "A bug that only running it would find").
+#
+# A liveness probe cannot see that. Any endpoint cheap enough to probe every ten
+# seconds reports the process, not the pipeline, and would have stayed green for
+# all 241. The fix is workers.Supervise, which treats a broker connection as a
+# session that ends and redials with jittered backoff, plus outbox lag reported
+# from the *database* connection so it keeps arriving while the broker is down.
+# The signal to alert on is a rising `oldest_age_seconds`, not a probe.
+#
+# The probe that would be worth adding is the opposite shape: not "am I alive"
+# but "has this consumer acked anything since the queue was last non-empty",
+# which is a metrics question. That is the Prometheus bonus, not this one.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/component: consumer
+spec:
+  # Fixed, not autoscaled — see the note in api-hpa.yaml. Scale by hand with
+  # `kubectl scale deployment/worker --replicas=N`; competing consumers need no
+  # code change, but N is also a claim on the connection budget.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/component: consumer
+    spec:
+      # THE number on this manifest. It must exceed the longest in-flight job or
+      # a rolling deploy SIGKILLs a worker mid-payment — the customer is charged
+      # and the order never leaves CHARGING until RecoverStuckCharges notices,
+      # minutes later.
+      #
+      # 40 = the 30s the process gives itself to drain (WORKER_SHUTDOWN_TIMEOUT)
+      # plus slack. Kubernetes defaults to 30, which would be exactly equal to
+      # the drain budget and therefore always a photo finish. Raise both together
+      # if PAYMENT_TIMEOUT ever goes up.
+      terminationGracePeriodSeconds: 40
+
+      automountServiceAccountToken: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        # Same gate as the API: exits non-zero until Postgres is reachable and
+        # migrated. See api-deployment.yaml for why this shape.
+        - name: wait-for-schema
+          image: order-processing:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/migrate", "version"]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: worker
+          image: order-processing:0.1.0
+          command: ["/app/worker"]
+          imagePullPolicy: IfNotPresent
+
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+
+          env:
+            # Smaller than WORKER_CONCURRENCY (10), and that is the reserve →
+            # pay → commit decision showing up in the pool size. A worker waiting
+            # on the payment provider holds no transaction and no connection:
+            # rule 4, never do network I/O inside a transaction. If the pool had
+            # to cover every in-flight job, a 2.4s provider call would pin a
+            # connection for its whole duration and ten of those would be the
+            # entire budget.
+            - name: DB_MAX_OPEN_CONNS
+              value: "8"
+            - name: DB_MAX_IDLE_CONNS
+              value: "4"
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

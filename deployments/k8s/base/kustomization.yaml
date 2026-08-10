@@ -1,0 +1,44 @@
+# The application, and nothing else.
+#
+# No Postgres, no RabbitMQ, no Redis and no Secret: a real deployment points at
+# managed instances of all three and gets its credentials from a secret manager,
+# so putting them here would mean every environment inheriting a database it has
+# to override away. overlays/dev supplies them for a laptop cluster.
+#
+# Applying this alone therefore leaves pods in CreateContainerConfigError,
+# waiting for a Secret named `app-secrets` that nothing here creates. That is the
+# correct failure — see ../README.md for the four keys it needs.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: order-processing
+
+# includeSelectors is false on purpose. A label transformer that also writes
+# selectors would try to set spec.selector on the Job, which the API server
+# generates itself and refuses to have changed on re-apply.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: order-processing
+
+resources:
+  - namespace.yaml
+  - migrate-job.yaml
+  - api-deployment.yaml
+  - api-service.yaml
+  - api-hpa.yaml
+  - api-pdb.yaml
+  - worker-deployment.yaml
+  - relay-deployment.yaml
+  - networkpolicy.yaml
+
+# Generated rather than written by hand so the name carries a hash of the
+# contents: editing app.env produces a new ConfigMap name, which changes the pod
+# spec, which rolls the deployment. Mutating a fixed-name ConfigMap changes
+# nothing until something else happens to restart the pods, which is how config
+# changes get "applied" hours later during an unrelated deploy.
+configMapGenerator:
+  - name: app-config
+    envs:
+      - app.env

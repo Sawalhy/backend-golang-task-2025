@@ -1,0 +1,92 @@
+# base/networkpolicy.yaml denies all ingress in the namespace. These are the
+# holes the bundled datastores need, and they are written as podSelectors rather
+# than "allow everything in the namespace" so that the rule states the actual
+# dependency: only the three application processes may open a connection to
+# Postgres or RabbitMQ, and only the API may reach Redis.
+#
+# The management UI on 15672 is deliberately not opened to anything. Reach it
+# with `kubectl port-forward`, which goes through the kubelet rather than the pod
+# network and is therefore unaffected by any of this.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-from-app
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: relay
+        # The Jobs, and the wait-for-schema init containers, which run under the
+        # pod labels of whichever workload they belong to — except these two,
+        # which are their own pods.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: migrate
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: seed
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-rabbitmq-from-app
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rabbitmq
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # The API is here because of SSE: each replica binds its own exclusive
+        # queue to order.# so it can push status changes to the browsers it
+        # happens to be holding.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: relay
+      ports:
+        - protocol: TCP
+          port: 5672
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis-from-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Only the API. Rate limiting is HTTP middleware; nothing in the worker
+        # or the relay touches Redis.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+      ports:
+        - protocol: TCP
+          port: 6379

@@ -1,0 +1,36 @@
+# The per-workload slice of the connection budget restated for the managed
+# instance. See ../kustomization.yaml for the arithmetic.
+#
+# Two patches in one file, separated by ---, because they are one decision.
+# Changing either number without the other, or without maxReplicas in
+# hpa-range.yaml, breaks the sum.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            - name: DB_MAX_OPEN_CONNS
+              value: "8"
+            - name: DB_MAX_IDLE_CONNS
+              value: "8"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          env:
+            - name: DB_MAX_OPEN_CONNS
+              value: "8"
+            - name: DB_MAX_IDLE_CONNS
+              value: "4"

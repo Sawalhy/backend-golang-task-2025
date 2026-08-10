@@ -1,0 +1,227 @@
+# The HTTP API. Stateless, horizontally scalable, and the only one of the three
+# processes that takes traffic.
+#
+# --- The connection budget --------------------------------------------------
+#
+# Postgres spawns an OS process per connection and saturates at roughly 8-16 for
+# a 4-core instance; past that, added connections contend for the same cores and
+# throughput DROPS. Kubernetes then multiplies whatever number you picked by the
+# replica count, which is the most common way a working application falls over
+# once it is autoscaled.
+#
+# The whole budget, against `max_connections = 100`:
+#
+#     api      6 conns × 6 replicas (HPA max)   = 36   → 42 mid-rollout (maxSurge 1)
+#     worker   8 conns × 2 replicas             = 16   → 24 mid-rollout
+#     relay    4 conns × 2 replicas             =  8   → 12 mid-rollout
+#     migrate Job                               ≈  2
+#                                                 ----
+#     worst case, everything rolling at once      80
+#     superuser_reserved_connections + psql       10
+#                                                 ----
+#                                                 90 < 100 ✓
+#
+# maxSurge is part of the arithmetic on purpose: a rolling update runs old and
+# new pods together, so the peak is `replicas + surge`, not `replicas`. Sizing to
+# the steady state is how a deploy — not load — exhausts the pool.
+#
+# Note also that 36 steady-state connections is already past the 8-16 where a
+# 4-core Postgres stops going faster. `max_connections` is the limit that errors;
+# saturation is the limit that matters, and it is lower. Decoupling the two is
+# what PgBouncer is for, and it is the next thing this deployment needs — see
+# ../README.md.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/component: http
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the desired count during a deploy. The API is the only
+      # thing serving customers, and one extra pod for a few seconds is cheaper
+      # than a window where the remaining replica takes all the traffic.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/component: http
+    spec:
+      # 20s of drain (HTTP_SHUTDOWN_TIMEOUT) plus the 5s preStop sleep, plus
+      # slack. The clock starts at the preStop hook, not at SIGTERM.
+      terminationGracePeriodSeconds: 30
+
+      # The API never talks to the Kubernetes API server, so mounting a token
+      # that would let it only hands an attacker with RCE a cluster credential.
+      automountServiceAccountToken: false
+
+      securityContext:
+        runAsNonRoot: true
+        # gcr.io/distroless/static:nonroot. Pinned explicitly rather than relying
+        # on the image's USER line, so `runAsNonRoot` has a uid to verify against
+        # instead of failing the pod with "container has runAsNonRoot and image
+        # has non-numeric user".
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread replicas over nodes so losing one node does not take the whole
+      # API with it. ScheduleAnyway, not DoNotSchedule: on a single-node
+      # development cluster a hard constraint leaves every replica after the
+      # first permanently Pending, which turns a resilience feature into an
+      # outage.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+
+      initContainers:
+        # Gate on the schema existing.
+        #
+        # `migrate version` exits non-zero when Postgres is unreachable OR when
+        # no migration has ever been applied, and zero otherwise — which is
+        # exactly the condition "the database is up and the migrate Job has run".
+        # The kubelet retries a failed init container with backoff, so this is a
+        # wait loop that needs no shell, no extra image and no sleep: the runtime
+        # image is distroless, so `until pg_isready` was never an option.
+        #
+        # Without it, a pod that starts before the Job finishes fails its ping in
+        # database.Open and CrashLoopBackOffs instead — recoverable, but it reads
+        # as a broken deployment rather than an ordering constraint.
+        - name: wait-for-schema
+          image: order-processing:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/migrate", "version"]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: api
+          image: order-processing:0.1.0
+          # One image, five binaries (docker/Dockerfile:22). The entry point is
+          # chosen here, so api, worker and relay are the same artifact.
+          command: ["/app/api"]
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+
+          env:
+            # This deployment's slice of the connection budget above. Set here
+            # rather than in the ConfigMap because the three processes have
+            # different concurrency profiles and must not share one number.
+            #
+            # Idle equals open deliberately: an API pod that has been serving
+            # traffic should not be re-establishing TCP and re-authenticating on
+            # every burst. DB_MAX_IDLE_CONNS may not exceed DB_MAX_OPEN_CONNS —
+            # config.validate() refuses to boot if it does.
+            - name: DB_MAX_OPEN_CONNS
+              value: "6"
+            - name: DB_MAX_IDLE_CONNS
+              value: "6"
+
+          # /healthz is liveness: the process answers. It deliberately does not
+          # touch Postgres — a liveness probe that fails on a slow query gets
+          # every pod killed during exactly the incident you need them alive for,
+          # turning a degraded database into a cluster-wide restart storm.
+          #
+          # /readyz is readiness: this instance can actually serve, database
+          # included. A pod that cannot reach Postgres leaves the Service's
+          # endpoints instead of answering with 500s.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30 # 60s to boot before anything gives up
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            # Above the 2s the handler gives its own Postgres ping, so the probe
+            # reports the health check's verdict rather than pre-empting it.
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              # Endpoint removal and SIGTERM are concurrent, not ordered: kube-proxy
+              # on every node has to observe the endpoint going away, and until it
+              # does it keeps sending new connections to a pod that has already
+              # stopped accepting them. That race is the usual source of 502s
+              # during an otherwise clean rolling deploy.
+              #
+              # The native SleepAction rather than `exec: sleep 5`, because the
+              # image is distroless and has no shell and no coreutils to exec.
+              # Requires Kubernetes 1.29+ (beta, on by default from 1.30).
+              sleep:
+                seconds: 5
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # Memory only, and equal to nothing else: memory is incompressible,
+              # so a pod over its limit is killed and the limit is the only thing
+              # stopping one leak from taking the node's other pods with it.
+              #
+              # There is deliberately no CPU limit. CFS throttling hurts exactly
+              # the workload that cares — a service whose p99 is graded — by
+              # stalling a request that briefly needs more than its share, even on
+              # an idle node. The request is what the scheduler and the HPA use;
+              # the limit only adds tail latency. (Go 1.25 reads the cgroup quota
+              # for GOMAXPROCS, so a limit would also silently shrink the
+              # scheduler's parallelism.)
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            # The binary is static and nothing writes to disk: logs go to stdout,
+            # there are no temp files, and the migrations are read-only.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

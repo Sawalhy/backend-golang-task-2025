@@ -1,0 +1,65 @@
+# Production shape: the application only, pointed at managed Postgres, RabbitMQ
+# and Redis.
+#
+# What is NOT here is most of the content. No datastores — a database that a
+# `kubectl delete namespace` can destroy is not a production database, and
+# running Postgres well on Kubernetes is a project rather than a manifest. No
+# secretGenerator either: the credentials are not in this repository, which is
+# the difference between this overlay and ../dev.
+#
+#     kubectl apply -k deployments/k8s/overlays/prod
+#
+# ...requires a Secret named `app-secrets` to already exist in the namespace,
+# holding DATABASE_URL, RABBITMQ_URL, JWT_SECRET and REDIS_PASSWORD. Create it
+# from a real source — External Secrets Operator pulling from a cloud secret
+# manager, the Secrets Store CSI driver, or Sealed Secrets — not with
+# `kubectl create secret` from a shell that keeps history.
+#
+# One consequence worth stating: a Secret referenced by name has no content hash,
+# so rotating a credential changes nothing until the pods restart. Either
+# annotate the pod template with a checksum of the secret version, or run
+# something like Reloader. Silently continuing to use the old credential until an
+# unrelated deploy happens to pick up the new one is worse than either.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: order-processing
+
+resources:
+  - ../../base
+
+# Where the image actually comes from. The base carries a bare
+# `order-processing:0.1.0` because a laptop cluster loads it by hand; a real
+# deploy pins a registry and an immutable tag, and the CI pipeline sets the tag
+# with `kustomize edit set image` rather than editing this file.
+images:
+  - name: order-processing
+    newName: ghcr.io/sawalhy/order-processing
+    newTag: "0.1.0"
+
+# Redone against the managed instance's own limit rather than the 100 the dev
+# Postgres is started with. Against `max_connections = 200`:
+#
+#     api      8 × 8 replicas (HPA max) = 64  → 72 mid-rollout
+#     worker   8 × 4 replicas           = 32  → 40 mid-rollout
+#     relay    4 × 2 replicas           =  8  → 12 mid-rollout
+#     migrate Job                       ≈  2
+#     superuser + operator + monitoring   10
+#                                        ----
+#                                        136 < 200 ✓
+#
+# The arithmetic passes and the shape is still wrong, which is the honest note to
+# end on: 64 API connections is far past the 8-16 where a small Postgres stops
+# going faster, so this only holds because the managed instance is bigger. The
+# fix that scales is PgBouncer in transaction mode — see ../../README.md, and
+# note that it needs a DSN change, not just a manifest.
+replicas:
+  - name: worker
+    count: 4
+  - name: relay
+    count: 2
+
+patches:
+  - path: pool-sizing.yaml
+  - path: hpa-range.yaml

@@ -1,0 +1,25 @@
+# A rolling update is not the only way pods disappear. A node drain — an upgrade,
+# a spot reclaim, a cluster autoscaler consolidating — evicts every pod on that
+# node at once, and the Deployment's maxUnavailable has no say in it. This is the
+# object that does.
+#
+# The worker and the relay get no budget on purpose: both are designed to be
+# killed. A worker dying mid-charge leaves the delivery unacked and it is
+# redelivered, with the same idempotency key so the provider charges once; the
+# relay dying mid-publish leaves the outbox row unsent. There is no window during
+# which losing all of them corrupts anything, only one during which work waits.
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  # minAvailable rather than maxUnavailable, because the HPA changes the replica
+  # count underneath: `maxUnavailable: 1` would permit draining 5 of 6 pods one
+  # at a time, while this holds a floor no matter what the current count is.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api

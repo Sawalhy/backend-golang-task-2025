@@ -1,0 +1,26 @@
+# ClusterIP, not LoadBalancer or NodePort: what sits in front of this differs per
+# environment — an Ingress controller, a service mesh gateway, a cloud load
+# balancer — and baking one choice into the base makes every environment that
+# wants a different one patch it away.
+#
+# No session affinity, and that is a design property rather than an oversight.
+# SSE streams are held by whichever API replica the client landed on, and every
+# replica binds its own exclusive queue to `order.#`, so all of them see every
+# event (cmd/api/main.go:128). A reconnecting client can be routed anywhere and
+# still receives current state immediately.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

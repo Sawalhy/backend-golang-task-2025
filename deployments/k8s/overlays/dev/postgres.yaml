@@ -1,0 +1,103 @@
+# Postgres for a laptop cluster. NOT a production database, and the gap is not
+# subtle: one replica, no failover, no backup, no WAL archiving, no connection
+# pooler, and a PVC whose lifetime is the cluster's. A real deployment points
+# DATABASE_URL at a managed instance — RDS, Cloud SQL, Neon — and deletes this
+# file, which is why it lives in an overlay and not in base.
+#
+# A StatefulSet rather than a Deployment, because the pod owns a PVC and its
+# identity has to survive rescheduling. A Deployment with a PVC will happily try
+# to start the replacement pod before the old one has released the volume, and
+# ReadWriteOnce then deadlocks the rollout.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  # Headless: DNS resolves straight to the pod, with no load balancing in front
+  # of a thing that must never be load balanced.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          args:
+            - "postgres"
+            # Same 100 the connection budget in base/api-deployment.yaml is
+            # computed against. Raising it here would hide pool exhaustion
+            # instead of fixing it — the app would stop erroring and start
+            # queueing inside a saturated Postgres.
+            - "-c"
+            - "max_connections=100"
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-auth
+          env:
+            # A subdirectory, not the mount point itself. Ext4 volumes arrive
+            # with a lost+found directory, and initdb refuses to initialise a
+            # data directory that is not empty.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              # -U and -d are both required. Without them pg_isready checks the
+              # wrong database and reports ready before ours exists, which is the
+              # "connection refused on first boot" race wearing a green tick.
+              command: ["pg_isready", "-U", "postgres", "-d", "orders"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "orders"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

@@ -1,0 +1,40 @@
+# Cluster definition for local verification.
+#
+#   kind create cluster --name orders --config deployments/k8s/kind-cluster.yaml
+#
+# One node. kind removes the control-plane's NoSchedule taint on a single-node
+# cluster, so workloads run there — which is precisely why the API's
+# topologySpreadConstraints use `whenUnsatisfiable: ScheduleAnyway`. A hard
+# constraint would leave every replica after the first permanently Pending here,
+# and the manifests are meant to work on this cluster as well as a real one.
+#
+# Add worker nodes to see the spread actually spread, and to have a second node
+# to drain against the PodDisruptionBudget:
+#
+#   nodes:
+#     - role: control-plane
+#     - role: worker
+#     - role: worker
+#
+# Each node is a container running its own kubelet and containerd, so budget
+# roughly 700MB of Docker's memory allowance per node before any workload.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+
+# Pinned so the generated kubeconfig is stable across recreations. Without this
+# the API server lands on a random host port and every existing kubeconfig
+# entry goes stale.
+networking:
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 6443
+
+  # Uncomment to install a CNI that enforces NetworkPolicy — Calico or Cilium —
+  # instead of kind's default kindnet, which accepts NetworkPolicy objects and
+  # ignores them. Nothing else in this repository comes up until that CNI is
+  # installed, so leave it commented unless that is what you are testing.
+  #
+  # disableDefaultCNI: true
+
+nodes:
+  - role: control-plane

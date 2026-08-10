@@ -1,0 +1,66 @@
+# A complete, self-contained system on a laptop cluster: the base plus the three
+# datastores it deliberately does not ship, plus demo data.
+#
+#     kubectl apply -k deployments/k8s/overlays/dev
+#
+# Everything here is development-grade on purpose. The credentials are in this
+# file in plain text, which is exactly what makes them obviously not secrets.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: order-processing
+
+resources:
+  - ../../base
+  - postgres.yaml
+  - rabbitmq.yaml
+  - redis.yaml
+  - seed-job.yaml
+  - datastore-networkpolicy.yaml
+
+patches:
+  - path: namespace-psa.yaml
+
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    literals:
+      # Re-enables the Swagger UI at /swagger/index.html, which the base turns
+      # off because publishing a complete map of the API — every route, field and
+      # validation rule — next to the API itself is free reconnaissance.
+      - APP_ENV=development
+      - LOG_LEVEL=debug
+      # The simulated provider has to be able to produce all three outcomes.
+      # A provider that always succeeds exercises none of the paths that make
+      # this system interesting: no declines, no timeouts, and never the UNKNOWN
+      # that reconciliation exists for.
+      - PAYMENT_FAILURE_RATE=0.10
+      - PAYMENT_TIMEOUT_RATE=0.02
+
+# Development credentials, in the clear, on purpose.
+#
+# The generated names carry a content hash, so changing a value here produces a
+# new Secret name, a changed pod spec and a rolling restart. A hand-written
+# Secret would be updated in place and the pods would keep using the old value
+# until something unrelated restarted them.
+#
+# The production overlay does none of this — see ../prod/kustomization.yaml.
+secretGenerator:
+  - name: app-secrets
+    literals:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/orders?sslmode=disable
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - JWT_SECRET=dev-secret-change-me-in-production-0123456789
+      - REDIS_PASSWORD=
+
+  - name: postgres-auth
+    literals:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=orders
+
+  - name: rabbitmq-auth
+    literals:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
