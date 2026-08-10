@@ -3,12 +3,13 @@
 > What every test asserts, how it is built, and — for the ones that matter — why
 > it is written the way it is rather than the obvious way.
 
-**178 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
-plus the rate limiter), and pure unit tests where no infrastructure is needed.
+**177 tests, 83.9% statement coverage.** Integration against real Postgres,
+RabbitMQ and Redis (`tests/`, plus the rate limiter), and pure unit tests where
+no infrastructure is needed.
 
 | File | Tests | Covers | Needs |
 |---|---|---|---|
-| `tests/api_test.go` | 25 | Every REST endpoint: auth, CRUD, RBAC, validation | Postgres |
+| `tests/api_test.go` | 32 | Every REST endpoint: auth, CRUD, RBAC, validation | Postgres |
 | `tests/concurrency_test.go` | 7 | Overselling, deadlock ordering, idempotency (A, G) | Postgres |
 | `tests/saga_test.go` | 12 | Double charge, cancel-vs-charge, worker death (C, D, E) | Postgres |
 | `tests/notification_test.go` | 11 | Send-once, leases, retries (I) | Postgres |
@@ -21,7 +22,7 @@ plus the rate limiter), and pure unit tests where no infrastructure is needed.
 | `tests/supervisor_test.go` | 4 | Reconnect after connection loss | RabbitMQ + mgmt API |
 | `tests/refund_test.go` | 8 | Refund execution and compensation | Postgres |
 | `internal/api/middleware/ratelimit_test.go` | 7 | Token bucket atomicity, fail-open | Redis |
-| `internal/config/config_test.go` | 10 | Env parsing, validation, boot refusal | — |
+| `internal/config/config_test.go` | 9 | Env parsing, validation, boot refusal | — |
 | `internal/services/status_hub_test.go` | 7 | SSE fan-out, no leaks, non-blocking publish | — |
 | `internal/services/payment_provider_test.go` | 11 | Simulated provider idempotency, outcomes | — |
 | `internal/models/models_test.go` | 9 | State machine, reachability, enum round-trips | — |
@@ -78,9 +79,9 @@ loaded gun left for whoever maintains this next, traded for coverage of branches
 that are almost entirely `if err != nil { return fmt.Errorf("...: %w", err) }`,
 where the assertion is that Go propagates errors.
 
-**Those branches are now covered by fault injection instead** — see §10.
-Because we own Postgres in tests we can make it genuinely fail, which exercises
-the same branches with real semantics and without opening the seam.
+**Those branches are covered by fault injection instead** — see §11. Because we
+own Postgres in tests we can make it genuinely fail, which exercises the same
+branches with real semantics and without opening the seam.
 
 ### Getting a database
 
@@ -188,23 +189,13 @@ wait cycle cannot form. Half the goroutines submit their items reversed; if
 someone removes the sort as a "simplification", this test starts failing with
 `40P01` instead of passing.
 
-### These tests were checked for teeth
-
-A concurrency test that passes proves nothing until you have watched it fail.
-`Reserve` was temporarily reverted to the naive read-then-write —
-`SELECT available`, check in Go, then `UPDATE`:
-
-```
---- FAIL: TestConcurrentBuyersCannotExceedStock
-    violates check constraint "inventory_available_check" (23514)  ... × 24
-    expected: 53   actual: 29
-```
-
-Twenty-four buyers passed the in-Go check simultaneously. It also showed the
-**second guard** working: `available` never went negative, because the `CHECK`
-refused what the application logic wrongly allowed. The `WHERE` clause turns an
-oversell into a clean 409; the constraint makes corruption impossible even when
-the code above it is wrong.
+**Two guards, tested separately.** `TestConcurrentBuyersCannotExceedStock`
+covers the `WHERE` clause, which turns an oversell into a clean 409.
+`TestDatabaseRefusesNegativeStock` covers `CHECK (available >= 0)`, which makes
+corruption impossible even if the application logic above it is ever wrong.
+Replace the conditional `UPDATE` with a read-then-write and the first test fails
+on the count while the constraint holds the line — which is the division of
+labour those two tests exist to pin down.
 
 ---
 
@@ -385,11 +376,13 @@ would test the wrong thing — these tests are about the *report*.
 
 ---
 
-## 9. Real-time — `status_hub_test.go`, `sse_test.go`, `backplane_test.go`
+## 9. Real-time, transport and middleware
 
-Three layers, tested separately because they fail differently.
+The SSE stack in three layers (9.1–9.3), tested separately because they fail
+differently, then the machinery underneath it: the rate limiter that guards the
+same routes (9.4), and the broker plumbing every consumer depends on (9.6–9.7).
 
-### The hub (pure unit, no database, runs anywhere)
+### 9.1 The hub (pure unit, no database, runs anywhere)
 
 | Test | Asserts |
 |---|---|
@@ -408,7 +401,7 @@ block it, event delivery would stop for **every** client on that instance.
 `TestUnsubscribeClosesChannelAndReleasesMemory` asserts the *outer* map shrinks
 too — otherwise it grows by one entry per order ever streamed and never shrinks.
 
-### The endpoint (`sse_test.go`, full HTTP stack)
+### 9.2 The endpoint (`sse_test.go`, full HTTP stack)
 
 | Test | Asserts |
 |---|---|
@@ -423,7 +416,7 @@ token per request, and an SSE connection is one request held open for minutes, s
 a reconnecting client would be throttled for behaving correctly. The limiter is
 covered separately, in §9.4.
 
-### The topology (`backplane_test.go`, needs RabbitMQ)
+### 9.3 The topology (`backplane_test.go`, needs RabbitMQ)
 
 | Test | Asserts |
 |---|---|
@@ -455,7 +448,7 @@ fake client would execute the script in Go and test the opposite of what matters
 `TestRateLimiterFailsOpenWhenRedisIsUnreachable` asserts the behaviour claimed in
 SOLUTION.md directly — a cache outage must not become an API outage.
 
-### 9.5 Topology
+### 9.5 Why the SSE queues must not compete
 
 `TestBackplaneQueuesDoNotCompete` guards the subtlest topology decision in the
 system. The `payments` queue has N consumers precisely so each message is handled
@@ -464,15 +457,16 @@ browser connection that cares. If someone "simplifies" them into one shared
 durable queue, an `order.paid` reaches one replica while the customer sits on
 another and is never told.
 
-> **These tests originally used a fixed `time.Sleep` before publishing, and it
-> was wrong.** A topic exchange silently discards messages matching no binding,
-> so under any slowdown the publish beat the bind and the event vanished. They
-> now republish until delivery.
+> **These tests republish until delivery rather than sleeping before the first
+> publish.** A topic exchange silently discards messages matching no binding, so
+> a fixed sleep means that under any slowdown the publish beats the bind and the
+> event vanishes.
 >
-> The scoping test was worse: it asserts an event does *not* arrive, so an
-> unready binding made it **pass vacuously**. It now proves the backplane is live
-> by getting a matching event through *first*, then asserts the non-delivery. A
-> test that cannot fail for the right reason is worse than no test.
+> The scoping test needs more than that: it asserts an event does *not* arrive,
+> which an unready binding would satisfy **vacuously**. It therefore proves the
+> backplane is live by getting a matching event through *first*, then asserts
+> the non-delivery. A test that cannot fail for the right reason is worse than
+> no test.
 
 ---
 
@@ -508,11 +502,13 @@ one.
 
 ### 9.7 Broker reconnection (`supervisor_test.go`, needs RabbitMQ + management API)
 
-The regression tests for the worst bug in the project: a connection acquired once
-at startup and never redialled, so after RabbitMQ dropped it the relay failed
-**241 consecutive publishes** while its health check stayed green.
+A `Channel` belongs to a `Connection` and cannot outlive it, and amqp091-go does
+not reconnect. A connection acquired once at startup therefore fails permanently
+and *quietly* the first time the broker drops it: the process stays alive, its
+health check stays green, and every publish fails from then on. These tests
+guard `workers.Supervise`, which owns the connection lifecycle instead.
 
-Reproducing that needs a connection that dies *underneath* a running session.
+Exercising that needs a connection that dies *underneath* a running session.
 These tests use **RabbitMQ's management API to force-close the connection from
 the broker side** — the same thing the broker does to every client when it
 restarts, and both faster and more deterministic than killing a process.
@@ -530,14 +526,41 @@ tell the relay from a worker from an API replica.
 | `TestSupervisorRetriesAnUnreachableBrokerAndStopsCleanly` | An unreachable broker is retried, not fatal, and cancellation returns cleanly |
 
 The second and third are the ones that matter. Redialling is not the point —
-**work resuming** is. Against the original bug the second test fails exactly the
-way production did: the relay stays alive and never publishes again.
+**work resuming** is. Against a relay that never redials, the second test fails
+in the way that matters: the process stays alive and simply never publishes
+again.
 
 The third is the outbox earning its keep. Nothing is lost across a reconnect
 because unpublished rows still have `sent_at IS NULL`, so the next session claims
 the same batch.
 
-## 10. Failure paths — `failure_paths_test.go` + `faults_test.go`
+## 10. The refund consumer — `refund_test.go`
+
+Worth its own section because requesting a refund and executing one are
+different claims, and only the second returns any money.
+
+The saga tests (§4) prove a refund is **requested**: the order reaches
+`CANCELLED_REFUNDED` and a `payment.refund_requested` event lands in the outbox.
+These prove it is **executed**. That is the compensating action of the entire
+cancel-vs-charge design, and the one path where a bug costs real money in the
+direction nobody complains about — paying a customer back twice.
+
+| Test | Asserts |
+|---|---|
+| `TestRefundIsExecutedAgainstTheProvider` | The provider is actually called; payment → `REFUNDED`; completion announced |
+| `TestDuplicateRefundEventsRefundOnce` | Four deliveries, **one** refund |
+| `TestRefundSkipsPaymentsThatNeverSucceeded` | A declined charge is never refunded — that would be inventing a payout |
+| `TestRefundWithoutAProviderReferenceEscalates` | A `SUCCEEDED` payment with no reference errors rather than guessing at the card network, and stays refundable |
+| `TestRefundFailureLeavesThePaymentRefundable` | A refused refund is not recorded as done |
+| `TestRefundRejectsMalformedEvents` | Missing, empty, malformed and wrong-typed `paymentId` |
+| `TestRefundForAnUnknownPaymentErrors` | A stale replay surfaces rather than being swallowed |
+| `TestCancelDuringChargeLeadsToAnExecutedRefund` | End to end: cancel races the charge, charge wins, refund actually returns the money — charged once, refunded once, stock back |
+
+The last one is the full compensation loop end to end, which is the only test
+that shows the cancel-vs-charge design actually returning money rather than
+recording an intention to.
+
+## 11. Failure paths — `failure_paths_test.go` + `faults_test.go`
 
 What happens when the database fails part-way through an operation. The
 assertion in every case is **not** "an error came back" — that only proves Go
@@ -662,7 +685,7 @@ that the reservation left no trace, read back through the surviving connection.
 That is rollback with the exact semantics production would see, rather than an
 error a test author invented.
 
-## 11. Running it
+## 12. Running it
 
 ```bash
 # With Go installed — testcontainers provides Postgres
@@ -670,16 +693,27 @@ go test ./... -race
 ```
 
 ```powershell
-# Through the containerised toolchain
+# Through the containerised toolchain, against the running compose stack
 docker compose exec postgres createdb -U postgres orders_test
 $env:TEST_DATABASE_URL = "postgres://postgres:postgres@postgres:5432/orders_test?sslmode=disable"
 $env:TEST_RABBITMQ_URL = "amqp://guest:guest@rabbitmq:5672/"
-.\scripts\go.ps1 test ./... -count=1
+$env:TEST_REDIS_ADDR   = "redis:6379"
+.\scripts\go.ps1 test ./... -count 1
 .\scripts\go.ps1 test ./internal/services/... -race   # hub, no DB needed
 ```
 
-`-count=1` disables the result cache, which matters for tests whose outcome
-depends on external state.
+Each dependency has its own variable, and **anything unset skips rather than
+fails** — an environment gap should not look like a broken build. So a run
+without `TEST_REDIS_ADDR` silently omits the rate limiter suite; check the
+`ok`/`skip` lines rather than assuming a green run covered everything. The
+RabbitMQ management URL used by §9.7 is derived from `TEST_RABBITMQ_URL`, and
+only needs `TEST_RABBITMQ_MGMT` if it lives somewhere else.
+
+`-count 1` disables the result cache, which matters for tests whose outcome
+depends on external state. Write flags in the **space-separated** form when
+going through `scripts/go.ps1`; PowerShell does not reliably forward the
+`-flag=value` form through the wrapper, and a dropped `-coverpkg` fails silently
+as a plausible-looking but wrong number.
 
 ### On `-race`
 
@@ -691,14 +725,14 @@ concurrency tests against real Postgres say that.
 
 ---
 
-## 12. Coverage
+## 13. Coverage
 
-**71.6% of statements**, measured across `internal/` and `pkg/`:
+**83.9% of statements**, measured across `internal/` and `pkg/`:
 
 ```powershell
-.\scripts\go.ps1 test ./tests/... ./internal/services/... -count=1 `
-    -coverpkg=./internal/...,./pkg/... -coverprofile=coverage.out
-go tool cover -func=coverage.out
+.\scripts\go.ps1 test ./... -count 1 `
+    -coverpkg ./internal/...,./pkg/... -coverprofile coverage.out
+go tool cover -func coverage.out
 ```
 
 > `-coverpkg` is mandatory here. The integration tests live in their own `tests`
@@ -730,53 +764,36 @@ indicative rather than exact; the 83.9% total is statement-weighted.)*
 individually above it** — so the number is not one well-covered package carrying
 several thin ones.
 
-The figure is worth reading with its history, though. It went 44.8% → 54.8% →
-71.6% → 77.1% → 82.6% → 83.9%, and the steps that mattered were not the ones that moved
-it most. Writing the payment saga tests found two real bugs; writing the refund
-consumer tests closed the largest correctness gap in the system and moved the
-number barely at all. Coverage is a useful prompt for *where to look next*. It is
-a poor measure of whether the dangerous paths were exercised concurrently, which
-is the only way this system's bugs appear.
-
 What the number does *not* capture is that the coverage is deliberately
 concentrated on the parts that can lose money or corrupt data — the conditional
 `UPDATE`, the saga, the CAS transitions, lease reclamation — while the untested
-remainder is mostly CRUD and wiring. A suite at 85% built from handler tests over
-mocked repositories would score better and catch none of the three real bugs this
-one found. Coverage measures which lines ran, not whether the dangerous ones were
-run *concurrently*, which is the only way this system's bugs appear.
+remainder is mostly CRUD and wiring.
 
-That said, the gap is real and closable. The cheapest wins, in order:
+That distinction is the whole argument for how this suite is built. A suite at
+85% built from handler tests over mocked repositories would score better on this
+metric and be blind to every defect that actually threatens this system, because
+**coverage measures which lines ran, not whether the dangerous ones were run
+concurrently** — and concurrently is the only way these bugs appear. The figure
+is a useful prompt for where to look next. It is a poor measure of whether the
+looking was worth anything.
 
-1. **`internal/config`** — pure functions, no I/O. Table-driven tests would take
-   it past 90% for ~72 statements of effort.
-2. **`internal/api/handlers`** — the single largest untested block (320
-   statements). The `sseFixture` pattern already provides a full HTTP stack, so
-   table-driven tests over products/users/admin are mechanical.
-3. **`internal/repository`** — targeted tests for the listing and admin queries
-   that the hot paths never touch.
+## 14. What is not covered, and why
 
-## 13. What is not covered, and why
-
-Two buckets remain, both deliberate. They are listed with what closing them would
+Three buckets, all deliberate. They are listed with what closing them would
 cost, because "untested" without a reason is just an apology.
 
-> The two buckets that used to sit here — the broker supervisor and the consumer
-> loops — are now covered; see §9.6 and §9.7. The supervisor tests kill the
-> connection from the broker side via the management API rather than needing a
-> `SIGKILL`, which turned out to be both faster and more deterministic. What a
-> real `SIGKILL` would still add is noted in §13.2.
+### 14.1 The residue of error branches
 
-### 13.1 Error branches — now covered by fault injection
+Fault injection (§11) reaches the error paths that matter. What remains
+uncovered is the residue: `if err != nil` paths on operations no test happens to
+fail, plus a few unreachable-in-practice branches like a `nil` statement guard.
 
-*(This bucket used to say these branches were unreachable without mocking. That
-was wrong on both counts — see §10.)*
+Each fault-injection test covers exactly one such statement, so closing this
+bucket means roughly one test per `return err` — a large number of tests whose
+combined assertion is that Go propagates errors. What was worth reaching is
+reached.
 
-The remaining uncovered statements are the residue: `if err != nil` paths on
-operations no test happens to fail, plus a few unreachable-in-practice branches
-like a `nil` statement guard. What was worth reaching is reached.
-
-### 13.2 What a real `SIGKILL` would still add
+### 14.2 What a real `SIGKILL` would still add
 
 The supervisor tests kill the *connection*. They do not kill a *process*, and
 there is one thing only that can demonstrate:
@@ -803,10 +820,10 @@ binary, wiring its environment, capturing stderr so a failure is diagnosable
 rather than mysterious — plus the fact that it runs in seconds and depends on
 process scheduling, so it belongs behind a build tag rather than on every save.
 
-Worth doing eventually. It is no longer the largest gap, because the reconnect
-path it was mainly wanted for is now covered directly.
+Worth doing, but not the largest gap: the reconnect path it was mainly wanted
+for is covered directly in §9.7.
 
-### 13.3 Not worth testing
+### 14.3 Not worth testing
 
 - **`cmd/*` entry points.** Wiring only. The logic they wire is covered, and a
   test would assert that the code is shaped the way it is shaped.
@@ -818,78 +835,10 @@ path it was mainly wanted for is now covered directly.
 
 ### Summary
 
-| Bucket | Statements | Verdict |
-|---|---|---|
-| Broker supervisor (severable connection / SIGKILL) | ~45 | **Worth doing** — guards the worst bug found |
-| Consumer loops (live broker) | ~60 | **Worth doing** — ordinary integration work |
-| Error branches (fault injection) | ~250 | **Leave** — cost exceeds benefit |
-| Entry points and scheduling | ~30 | **Leave** — wiring |
-
-Closing the first two would put coverage in the mid-eighties. Closing the third
-would push it higher and make the suite worse.
-
-## 14. The refund consumer — `refund_test.go`
-
-Worth its own section because it was the most consequential gap in the suite, and
-it had nothing to do with infrastructure.
-
-The saga tests prove a refund is **requested**: the order reaches
-`CANCELLED_REFUNDED` and a `payment.refund_requested` event lands in the outbox.
-Nothing proved it was ever **executed**. That is the compensating action of the
-entire cancel-vs-charge design, and it is the one path where a bug costs real
-money in the direction nobody complains about — paying a customer back twice.
-
-| Test | Asserts |
+| Bucket | Verdict |
 |---|---|
-| `TestRefundIsExecutedAgainstTheProvider` | The provider is actually called; payment → `REFUNDED`; completion announced |
-| `TestDuplicateRefundEventsRefundOnce` | Four deliveries, **one** refund |
-| `TestRefundSkipsPaymentsThatNeverSucceeded` | A declined charge is never refunded — that would be inventing a payout |
-| `TestRefundWithoutAProviderReferenceEscalates` | A `SUCCEEDED` payment with no reference errors rather than guessing at the card network, and stays refundable |
-| `TestRefundFailureLeavesThePaymentRefundable` | A refused refund is not recorded as done |
-| `TestRefundRejectsMalformedEvents` | Missing, empty, malformed and wrong-typed `paymentId` |
-| `TestRefundForAnUnknownPaymentErrors` | A stale replay surfaces rather than being swallowed |
-| `TestCancelDuringChargeLeadsToAnExecutedRefund` | End to end: cancel races the charge, charge wins, refund actually returns the money — charged once, refunded once, stock back |
+| Residual error branches | **Leave** — one test per `return err`, asserting that Go propagates errors |
+| Real process `SIGKILL` (broker redelivery) | **Worth doing**, behind a build tag |
+| Entry points and tick scheduling | **Leave** — wiring, reviewable by eye |
 
-The last one is the full compensation loop, which previously stopped at the
-outbox row.
-
-## 15. Recently closed
-
-Context on what moved, and why the number is not the point:
-
-| Was | Now | What it took |
-|---|---|---|
-| `internal/api/handlers` 23.6% | 84.2% | Table-driven tests over every endpoint |
-| `internal/services` 51.6% | 88.0% | Refund consumer, simulated provider, notifications |
-| `internal/repository` 48.6% | 80.7% | Listing and admin queries, audit, live-intent lookup |
-| `internal/config` 14.3% | 100% | Pure functions, table-driven |
-| `internal/models` 87.0% | 100% | State machine reachability, enum round-trips |
-| `pkg/logger` 58.0% | 100% | Trace id propagation |
-| `pkg/database` 75.0% | 91.7% | Error classification through wrapped errors |
-| **total 44.8%** | **83.9%** | |
-
-Several of those found real defects rather than moving a percentage: the
-worker-death recovery gap, the reconciliation CAS that abandoned half its work,
-and the backplane tests that were passing vacuously. The refund consumer was the
-largest correctness gap of the lot and needed no infrastructure at all — it had
-simply never been written.
-
-- **The broker reconnect.** `workers.Supervise` is verified by hand
-  (`docker compose restart rabbitmq`, watching both services redial with jittered
-  backoff), but nothing in the suite guards it. Needs a broker whose connection
-  can be severed on demand — toxiproxy, or a stoppable testcontainers RabbitMQ.
-  **This is the most valuable remaining test.**
-- **The broker supervisor and consumer loops** (`internal/workers`, 37.5%). Both
-  need a broker whose connection can be severed on demand; see the reconnect
-  regression test below.
-- **`cmd/*` entry points.** Wiring only, and the logic they wire is covered.
-- **The periodic loops themselves.** Every job is tested by calling its function
-  directly — `ReapOnce`, `RecoverStuckCharges`, `SweepExpiredLeases`,
-  `RollupClosedDays`, `DrainOnce`. The `everyTick` scheduling in `cmd/worker` is
-  not, so "the timer actually fires on the configured interval" rests on
-  inspection rather than a test.
-- **Actual process death.** `killWorkerMidCharge` reproduces the database *state*
-  a dead worker leaves behind, not a real `SIGKILL`, and nothing exercises
-  RabbitMQ redelivering an unacked message when a consumer's connection drops.
-  The recovery *from* that state is well covered; the broker mechanics that
-  produce it are not.
+Closing the first would push the number higher and make the suite worse.
