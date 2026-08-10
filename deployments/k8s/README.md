@@ -61,6 +61,13 @@ Any cluster works; kind is only what this was verified on. `overlays/dev` assume
 a default StorageClass that supports `ReadWriteOnce`, which kind, k3d, minikube,
 Docker Desktop and every managed cloud provide.
 
+One local-cluster caveat: `kubectl get hpa` reports `cpu: <unknown>/70%` on kind,
+because kind ships no metrics-server and there is nothing serving
+`metrics.k8s.io`. The HPA is valid and correctly configured — it is simply inert
+until something publishes pod metrics. Every managed cloud has it; locally,
+`kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml`
+plus `--kubelet-insecure-tls` is what makes the autoscaler observable.
+
 To tear it down: `kind delete cluster --name orders`.
 
 ## What the base deliberately omits
@@ -165,12 +172,29 @@ migration has been applied, and zero otherwise, which is exactly the readiness
 condition — and the kubelet's init-container backoff is the retry loop.
 
 **Pod churn was already survivable before any of this**, which is the part worth
-defending. Kill a worker mid-charge: the delivery is unacked and redelivered, and
-the idempotency key on the `payments` row means the provider charges once. Kill
-the relay mid-publish: the outbox row still has `sent_at IS NULL`. Kill an API
-pod holding SSE streams: clients reconnect and read current state. A rolling
-deploy is the failure this design was built for; these manifests only avoid
-provoking it unnecessarily.
+defending. Kill the relay mid-publish: the outbox row still has `sent_at IS
+NULL`. Kill an API pod holding SSE streams: clients reconnect and read current
+state. A rolling deploy is the failure this design was built for; these manifests
+only avoid provoking it unnecessarily.
+
+Killing a **worker** mid-charge is the interesting one, and the mechanism is not
+the one you would guess. Redelivery does not recover it: `ProcessOrder` skips any
+order that is no longer `PENDING`, and a half-charged order is already
+`CHARGING`, so the redelivered message acks and does nothing. Nothing else sees
+it either — the reservation reaper only expires `PENDING` orders, reconciliation
+only looks at `UNKNOWN`. A timer is the only thing that can notice a process
+stopped existing, which is what `RecoverStuckCharges` is for
+(`cmd/worker/main.go:149`); it re-drives the intent with the *same* idempotency
+key after a grace period longer than the provider timeout, so the provider still
+charges once.
+
+Measured here: 20 orders in flight, one worker deleted with `--force
+--grace-period=0`. The survivor completed its 10; the dead pod's 10 sat in
+`CHARGING` with `INITIATED` intents until the sweep claimed and resumed all 10
+about ninety seconds later (`claimed=10 recovered=10`). All 20 kept their
+original `payments` row, no order ever held a second intent, and stock reconciled
+exactly. The grace period is why recovery takes ~90s rather than being instant —
+that is the cost of not "recovering" payments that are merely slow.
 
 ## Why the worker and the relay have no probes
 

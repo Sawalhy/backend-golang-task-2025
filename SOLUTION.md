@@ -426,6 +426,56 @@ so it is structurally incapable of exhibiting a race — it cannot lose an updat
 deadlock, or enforce a constraint. Every interesting bug in this system is a
 database race, so a mock-based suite would pass while the system oversold stock.
 
+## Kubernetes
+
+`deployments/k8s`, plain Kustomize: a `base` holding the application and nothing
+else, `overlays/dev` adding the three datastores and demo data for a laptop, and
+`overlays/prod` adding a registry and replica counts but no datastores and no
+Secret. That split is the point — a real deployment uses managed Postgres,
+RabbitMQ and Redis, so a base that shipped them would make every real environment
+override a database away. `deployments/k8s/README.md` carries the reasoning; the
+one number that spans files is the connection budget:
+
+```
+Σ over deployments of (maxReplicas + maxSurge) × DB_MAX_OPEN_CONNS
+      < max_connections − headroom
+```
+
+An HPA is a claim on the database made by an object that has no idea the database
+exists, so `maxReplicas: 6` is that budget solved for replicas rather than an
+estimate of peak traffic, and `maxSurge` is in the sum because a rolling update
+runs old and new pods together.
+
+### Verified on kind
+
+Cluster `kindest/node:v1.36.1`, single node, Docker VM of 3.8 GiB.
+
+- All three kustomizations build and pass **kubeconform strict** (11, 24 and 11
+  objects for base, dev and prod).
+- `kubectl apply -k overlays/dev` reaches all-deployments-available in **~3
+  minutes** from an empty cluster. The init containers spend the first ~90s of
+  that in `Init:Error` on purpose: they are `/app/migrate version`, which exits
+  non-zero until Postgres answers, and the kubelet's backoff is the retry loop.
+  The runtime image is distroless, so there is no shell for a `pg_isready` loop.
+- An order goes `PENDING → PAID` through the relay and worker in ~6 seconds,
+  with inventory decremented and both notifications delivered.
+- **Worker killed mid-charge.** 20 orders in flight, one worker `--force
+  --grace-period=0` (SIGKILL, no drain — a node loss, not a deploy). The
+  survivor finished its 10; the dead pod's 10 were left in `CHARGING` with
+  `INITIATED` intents, and `RecoverStuckCharges` claimed and resumed all 10
+  within ~90 seconds of the kill — `claimed=10 recovered=10`. Every one of the
+  20 kept **the same `payments` row, and therefore the same idempotency key**;
+  no order ever held a second intent, and `available + sold` reconciled exactly
+  against the starting stock.
+
+Peak memory was 1.2 GiB of the VM's 3.8, so the manifests fit a laptop with room
+to spare.
+
+**The HPA cannot actually scale on kind**, because kind ships no metrics-server
+and the HPA therefore reports `cpu: <unknown>/70%`. The object is valid and
+correct; it is inert until something serves `metrics.k8s.io`, which every managed
+cloud does and a local cluster does not.
+
 ## What is not built
 
 Stated plainly, because silence reads as unfinished.
@@ -443,7 +493,8 @@ Stated plainly, because silence reads as unfinished.
   anyway. The conditional `UPDATE` at order time is what actually decides who
   gets the last unit, which is why the API never invites "check stock, then
   order" as two steps.
-- **Bonus items** — Prometheus, tracing, Kubernetes manifests, WebSocket.
+- **Bonus items** — Prometheus, tracing, WebSocket. Kubernetes manifests are
+  built and verified; see "Kubernetes" above.
 - **No WebSockets, and no push for inventory.** Deliberate: a bidirectional
   protocol solves a problem order status does not have. This forfeits a bonus
   tick; the justification is worth more.
@@ -524,11 +575,19 @@ looks like from the outside, and it is the thing to alert on.
 
 ## Operational notes
 
-- **Pod churn is already survivable**, and not by luck. Kill a worker mid-charge:
-  the delivery is unacked and redelivered, and the idempotency key means the
-  provider charges once. Kill the relay mid-publish: the outbox row is still
-  unsent. Kill an API pod: clients re-read current state. A rolling deploy is
-  exactly the failure this design was built for.
+- **Pod churn is already survivable**, and not by luck. Kill a worker mid-charge
+  and the idempotency key on the `payments` row means the provider charges once.
+  What *recovers* the order is worth naming precisely, because the obvious answer
+  is wrong: the redelivered message is a no-op. `ProcessOrder` skips any order no
+  longer in `PENDING`, and a half-charged order is already `CHARGING`, so
+  redelivery acks and does nothing. The reaper only expires `PENDING` orders and
+  reconciliation only looks at `UNKNOWN` — a timer is the only thing that can
+  notice a process stopped existing, which is why `RecoverStuckCharges` exists
+  (`cmd/worker/main.go:149`). It re-drives the abandoned intent with the same key
+  after a grace period that must exceed the provider timeout. Kill the relay
+  mid-publish: the outbox row is still unsent. Kill an API pod: clients re-read
+  current state. A rolling deploy is exactly the failure this design was built
+  for.
 - **`stop_grace_period` must exceed the longest in-flight job**, or a rolling
   deploy SIGKILLs a worker mid-payment.
 - **Scaling the API multiplies the connection pool.** The constraint is
