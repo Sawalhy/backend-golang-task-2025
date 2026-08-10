@@ -48,10 +48,12 @@ type faultInjector struct {
 }
 
 type faultRule struct {
-	match     string // matched against the SQL text and the target table
-	remaining int
+	match     string // matched against the SQL text and the target table; "" matches everything
+	remaining int    // used when nth == 0: fail the next `remaining` matches
+	nth        int   // when > 0, fail only the nth match and let the rest through
+	seen       int
 	err       error
-	fired     int
+	fired      int
 }
 
 func newFaultInjector() *faultInjector { return &faultInjector{} }
@@ -108,13 +110,24 @@ func (f *faultInjector) maybeFail(db *gorm.DB) {
 	defer f.mu.Unlock()
 
 	for _, r := range f.rules {
-		if r.remaining == 0 {
-			continue
-		}
 		if !strings.Contains(sql, r.match) && !strings.EqualFold(table, r.match) {
 			continue
 		}
-		r.remaining--
+
+		r.seen++
+
+		if r.nth > 0 {
+			// Positional: let every other call through, fail only this one.
+			if r.seen != r.nth {
+				continue
+			}
+		} else {
+			if r.remaining == 0 {
+				continue
+			}
+			r.remaining--
+		}
+
 		r.fired++
 		_ = db.AddError(r.err)
 		return
@@ -133,6 +146,22 @@ func (f *faultInjector) FailNext(match string, times int, err error) *faultRule 
 	defer f.mu.Unlock()
 
 	rule := &faultRule{match: match, remaining: times, err: err}
+	f.rules = append(f.rules, rule)
+	return rule
+}
+
+// FailNthCall arms a fault on the Nth database operation after arming, letting
+// every other call through. `match` narrows which calls are counted; "" counts
+// all of them.
+//
+// This is what makes a SWEEP possible: run the same operation once per position
+// and fail a different step each time, so every error branch on the path is
+// walked rather than the one or two a test author happened to pick.
+func (f *faultInjector) FailNthCall(match string, n int, err error) *faultRule {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	rule := &faultRule{match: match, nth: n, err: err}
 	f.rules = append(f.rules, rule)
 	return rule
 }
