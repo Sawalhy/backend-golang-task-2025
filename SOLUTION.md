@@ -88,9 +88,9 @@ role checks, Redis token-bucket rate limiting, panic recovery, input validation,
 Swagger/OpenAPI, golang-migrate migrations, connection pooling, graceful
 shutdown on SIGTERM.
 
-**Bonus taken:** RabbitMQ, and load testing (`cmd/loadtest`). **Bonus not
-taken:** Prometheus, tracing, Kubernetes manifests, WebSocket — see
-[What is not built](#what-is-not-built).
+**Bonus taken:** RabbitMQ, load testing (`cmd/loadtest`), and Kubernetes
+manifests (`deployments/k8s`, reasoning in its own README). **Bonus not taken:**
+Prometheus, tracing, WebSocket — see [What is not built](#what-is-not-built).
 
 **One deliberate deviation from the brief.** `README.md:30` says "Database
 migrations using GORM". Migrations run through **golang-migrate** instead, and
@@ -568,20 +568,23 @@ Stated plainly, because silence reads as unfinished.
   order" as two steps. This forfeits half of `README.md:110-114` deliberately.
 - **WebSocket** — a bidirectional protocol solves a problem order status does
   not have. This forfeits a bonus tick; the justification is worth more.
-- **Prometheus, distributed tracing, Kubernetes manifests** — the remaining
-  bonus items.
+- **Prometheus and distributed tracing** — the remaining bonus items.
 - **A real `SIGKILL` test.** Process death is reproduced at the database level
   rather than by killing a subprocess, and connection loss is reproduced by
   force-closing the connection from the broker side. What neither shows directly
   is RabbitMQ redelivering an unacked message when a consumer process dies
-  mid-handler; that half is argued from the code. `docs/TESTING.md` §14.2 has
-  the shape it would take.
+  mid-handler; that half is argued from the code. The kind run recorded in
+  `deployments/k8s/README.md` does kill a real worker pod and watch recovery
+  complete, but it is a manual run, not a test in the suite. `docs/TESTING.md`
+  §14.2 has the shape it would take.
 
 ## Operational notes
 
 - **Pod churn is already survivable**, and not by luck. Kill a worker
-  mid-charge: the delivery is unacked and redelivered, and the idempotency key
-  means the provider charges once. Kill the relay mid-publish: the outbox row is
+  mid-charge: `RecoverStuckCharges` re-drives the intent with the same
+  idempotency key, so the provider charges once. Redelivery is not what saves it
+  — `ProcessOrder` skips any order no longer `PENDING`, so the redelivered
+  message acks and does nothing. Kill the relay mid-publish: the outbox row is
   still unsent. Kill an API pod: clients re-read current state. A rolling deploy
   is exactly the failure this design was built for.
 - **`stop_grace_period` must exceed the longest in-flight job**, or a rolling
