@@ -284,6 +284,91 @@ because **202 throughput and end-to-end completion are different numbers** and
 reporting the first as if it were the second is how an async system gets claimed
 as faster than it is.
 
+## Benchmarks
+
+`README.md:247` asks for performance benchmarks for concurrent operations. The
+load test above is the outside view — what a client sees through HTTP, and it
+cannot say where the time went. `tests/bench_test.go` is the inside view: the
+statements the design rests on, measured directly against real Postgres with the
+goroutines genuinely colliding.
+
+```bash
+go test ./tests -bench . -run NONE -benchmem
+```
+
+Most are paired, and the pair is the point:
+
+```
+contended     every goroutine hits the SAME inventory row
+uncontended   every goroutine gets its OWN row
+```
+
+Same code, same transaction, same pool. The only variable is whether the workers
+collide, so the ratio between the arms is the price of contention on the hot
+path — which is the number reserve → pay → commit was decided on. No single
+figure can show it, which is why nothing here reports one.
+
+### Measured
+
+8 goroutines against a pool of 25, Postgres 16, `-benchtime 2s -count 3`, median
+of the three:
+
+| | ms/op | ops/s | allocs/op |
+|---|---|---|---|
+| `ReserveInventory/uncontended` | 1.23 | 814 | 29 |
+| `ReserveInventory/contended` | 5.13 | 195 | 29 |
+| `OrderIntake/uncontended` | 1.57 | 636 | 512 |
+| `OrderIntake/contended` | 7.63 | 131 | 507 |
+| `OrderIntakeMultiLine` — two contended rows | 12.72 | 79 | 593 |
+| `TransitionLostRace` | **0.037** | **27,335** | 40 |
+
+**Contention costs 4–5×, and the intake pays more than the statement does.**
+Reserving alone degrades 4.2× when every worker wants the same row; the full
+intake transaction degrades 4.9×. The gap between those two figures is the
+interesting part: the reserving `UPDATE` takes the row lock partway through the
+transaction, and Postgres holds it until `COMMIT`. Everything the transaction
+does *after* reserving — the items, the reservations, the outbox row, the commit
+itself — is time the next buyer of that product spends queued. That is the whole
+argument for keeping the payment call outside the transaction stated as a
+measurement: a 2.4s provider call inside this transaction would extend a ~7.6ms
+lock hold by roughly three orders of magnitude.
+
+**The losing CAS is ~43× cheaper than the intake it deduplicates** — 37µs against
+1.57ms. A duplicate delivery costs about 2% of the work of the order it would
+have duplicated, because the `WHERE status = from` clause matches no row, so the
+statement writes no tuple and forces no commit. Dedupe by CAS rather than by
+read-then-decide is usually argued for on correctness; this is the throughput
+half of the same argument.
+
+**Allocations separate the two layers cleanly.** 29 allocs for the bare
+statement against ~510 for the intake transaction, and contention moves neither —
+which is the expected shape. Contention is spent waiting, not allocating, so an
+allocation count that moved with it would mean something was retrying.
+
+> **Absolute figures are host-bound; the ratios travel.** These were taken on
+> Docker Desktop for Windows, where Postgres commit `fsync` dominates every write
+> path and adds noise besides — `OrderIntakeMultiLine` spread 9.5–39ms across
+> three runs. The paired arms are measured minutes apart under identical
+> conditions, so the ratio between them is far more trustworthy than either
+> number alone. Re-run with `-count 5` and read the median.
+
+Two knobs are exposed for varying one thing at a time, which is the same method
+the load test uses: `-cpu` sets the number of parallel goroutines,
+`BENCH_POOL_CONNS` sets the pool they share. Driving the second while holding the
+first is the `DB_MAX_OPEN_CONNS` experiment above, run from the inside — the
+table above is the end-to-end version of it, and the figures in this section were
+all taken at the defaults.
+
+```bash
+go test ./tests -bench . -run NONE -cpu 1,8,32
+BENCH_POOL_CONNS=12 go test ./tests -bench Intake -run NONE -cpu 32
+```
+
+> Starve the pool hard enough and the bottleneck stops being the code under
+> measurement. `-cpu 32` against `BENCH_POOL_CONNS=8` saturated Docker Desktop on
+> this machine badly enough to wedge the daemon; on a host where Postgres is not
+> behind a VM, it is an ordinary run.
+
 ## Daily sales report, and the rollup
 
 `GET /admin/reports/daily` is served from **two sources**, and each row says

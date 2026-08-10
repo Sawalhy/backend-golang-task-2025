@@ -893,3 +893,99 @@ simply never been written.
   RabbitMQ redelivering an unacked message when a consumer's connection drops.
   The recovery *from* that state is well covered; the broker mechanics that
   produce it are not.
+
+## 16. Benchmarks — `bench_test.go`
+
+Deliverable 6, `README.md:247`: performance benchmarks for concurrent
+operations. Measured numbers and what they mean are in `SOLUTION.md`; this
+section is how the harness is built and why.
+
+```powershell
+$env:TEST_DATABASE_URL = "postgres://postgres:postgres@postgres:5432/orders_test?sslmode=disable"
+.\scripts\go.ps1 test ./tests -run NONE -bench . -benchtime 2s -count 3
+```
+
+`-run NONE` matches no test name, so only benchmarks run.
+
+### Paired arms, not single numbers
+
+Four of the six are one of two arms:
+
+```
+contended     every goroutine hits the SAME inventory row
+uncontended   every goroutine gets its OWN row
+```
+
+Same code, same transaction, same pool — the only variable is collision. A lone
+throughput figure for `Reserve` would be an artifact of how many workers happened
+to want the same product; the ratio between the arms is the thing that means
+something, and it is what the reserve → pay → commit decision was made on.
+
+`uncontended` allocates one product per `GOMAXPROCS`, because that is what
+`RunParallel` spawns by default. Fewer products and some workers would share
+rows, which is the other arm.
+
+### Reset before every round, not once at the top
+
+This is the part that took two attempts to get right, and it is worth knowing
+before writing another one.
+
+`testing` runs a benchmark body **repeatedly** with a growing `N`. A database
+remembers everything the previous round did: dead tuples piling up on the one
+hot inventory row, an outbox nobody is draining, orders and reservations growing
+without bound. Seeded once and reused, the same benchmark drifted **8×** between
+its first round and its last, monotonically — `OrderIntake/contended` reported
+34ms, then 154ms, for identical work. The number was mostly a function of how
+long the benchmark had already been running.
+
+`benchReset` truncates and reseeds before each timed round; `b.ResetTimer()`
+keeps that off the clock. After the fix, `ReserveInventory/uncontended` repeats
+within 4% across three runs.
+
+### One pool for the process
+
+`benchPool` opens a single pool on first use and `TestMain` closes it after the
+run. Not shared for tidiness: a benchmark body without sub-benchmarks re-executes
+per round, so opening a pool inside one opens a pool per round and releases none
+until the whole benchmark ends. A few rounds of that exhausts `max_connections`.
+Sharing is also closer to production, where api, worker and relay all contend for
+a fixed pool.
+
+This is why `openDB` exists separately from `newStore` in `support_test.go`:
+`newStore` ties the pool to the caller's `Cleanup`, which for a benchmark would
+close it underneath everything that ran later.
+
+### Failing from inside RunParallel
+
+`b.Fatal` is unusable in a parallel body — `FailNow` must be called from the
+goroutine running the benchmark, and those are not it. `benchFail` records the
+first error with `b.Error`, which is safe from any goroutine, and the worker
+returns.
+
+### What each one measures
+
+| Benchmark | What it prices |
+|---|---|
+| `ReserveInventory` | The conditional `UPDATE` alone — one round trip, no read-write gap. The statement failure mode A turns on |
+| `OrderIntake` | The whole intake transaction: load, reserve, order, items, reservations, outbox, commit. The graded core (`README.md:189`) |
+| `OrderIntakeMultiLine` | Two lines against two contended rows — the second reservation, and the arrangement that would deadlock without the `product_id` sort |
+| `TransitionLostRace` | The CAS on its **losing** branch |
+
+That last one measures the branch that is easy to overlook. A winning transition
+happens once per order; a losing one happens on every redelivery, every worker
+race, every consumer retry — so the losing branch is the hot one, and it is the
+branch the no-double-charge guarantee rests on. The benchmark drives the order to
+`CHARGING` before the clock starts, so every iteration is a duplicate delivery
+arriving at a worker that has already been beaten.
+
+`benchStock` is seeded at 1e9 deliberately. Let stock run out partway and the
+remaining iterations measure a *rejected* `UPDATE` — a different, much cheaper
+statement — and the average quietly stops meaning anything.
+
+### These are not tests
+
+They assert almost nothing and they are not part of `go test ./...`. Two
+exceptions, both guarding the measurement rather than the system:
+`TransitionLostRace` fails if a CAS ever wins twice, which would mean it had
+been measuring the wrong branch, and every benchmark fails on an unexpected
+error rather than timing a silent failure path.

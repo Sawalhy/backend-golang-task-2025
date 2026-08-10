@@ -62,6 +62,7 @@ func TestMain(m *testing.M) {
 	}
 
 	code := m.Run()
+	closeBenchPool() // the benchmarks share one pool for the whole process
 	cleanup()
 	os.Exit(code)
 }
@@ -116,22 +117,40 @@ func applyMigrations(dsn string) error {
 }
 
 // newStore opens a connection and wipes the tables, so each test starts from a
-// known state regardless of what ran before it.
-func newStore(t *testing.T) (*repository.Store, *gorm.DB) {
-	t.Helper()
+// known state regardless of what ran before it. The pool is closed when the test
+// that asked for it finishes.
+func newStore(tb testing.TB) (*repository.Store, *gorm.DB) {
+	tb.Helper()
 
-	log := logger.New("error", false)
+	db := openDB(tb, 25) // headroom for the concurrency tests
+	tb.Cleanup(func() { _ = database.Close(db) })
+
+	truncateAll(tb, db)
+	return repository.New(db, 3), db
+}
+
+// openDB opens a pool and deliberately does NOT register a cleanup: the caller
+// owns its lifetime.
+//
+// Split out of newStore for the benchmarks, which share a single pool across the
+// whole process (bench_test.go) because a benchmark body is re-run for every N
+// the framework tries. Tying the pool to the first caller's Cleanup would close
+// it underneath everything that ran after.
+//
+// It takes testing.TB, and maxOpen is a parameter, because DB_MAX_OPEN_CONNS is
+// the single biggest throughput lever this system has (SOLUTION.md, "the pool is
+// the bottleneck") — a benchmark that cannot vary it cannot reproduce that.
+func openDB(tb testing.TB, maxOpen int) *gorm.DB {
+	tb.Helper()
+
 	db, err := database.Open(context.Background(), database.Options{
 		DSN:          testDSN,
-		MaxOpenConns: 25, // headroom for the concurrency tests
-		MaxIdleConns: 25,
-	}, log)
-	require.NoError(t, err)
+		MaxOpenConns: maxOpen,
+		MaxIdleConns: maxOpen,
+	}, logger.New("error", false))
+	require.NoError(tb, err)
 
-	t.Cleanup(func() { _ = database.Close(db) })
-
-	truncateAll(t, db)
-	return repository.New(db, 3), db
+	return db
 }
 
 // truncateAll resets state between tests.
@@ -139,12 +158,12 @@ func newStore(t *testing.T) (*repository.Store, *gorm.DB) {
 // TRUNCATE ... RESTART IDENTITY CASCADE rather than DELETE: it is far faster,
 // and it resets the sequences so ids are predictable per test. Order does not
 // matter because CASCADE follows the foreign keys.
-func truncateAll(t *testing.T, db *gorm.DB) {
-	t.Helper()
+func truncateAll(tb testing.TB, db *gorm.DB) {
+	tb.Helper()
 	err := db.Exec(`
 		TRUNCATE notifications, outbox, payments, reservations, order_items,
 		         orders, inventory, products, users, audit_logs,
 		         daily_sales_rollup
 		RESTART IDENTITY CASCADE`).Error
-	require.NoError(t, err)
+	require.NoError(tb, err)
 }
