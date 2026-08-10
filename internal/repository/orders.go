@@ -2,7 +2,9 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"gorm.io/gorm"
@@ -55,7 +57,42 @@ func (r *OrderRepo) Transition(ctx context.Context, tx *gorm.DB, orderID uint64,
 	if res.Error != nil {
 		return false, fmt.Errorf("transitioning order %d %s -> %s: %w", orderID, from, to, res.Error)
 	}
+	if res.RowsAffected != 1 {
+		// Lost the CAS. Nothing changed, so there is nothing to audit — recording
+		// here would fill the log with transitions that never happened.
+		return false, nil
+	}
+
+	// Audited here rather than at the call sites, for the same reason this
+	// function exists at all: every order state change funnels through it, so
+	// putting the audit write here makes "no status change goes unrecorded" an
+	// invariant instead of something eight callers have to remember. It joins the
+	// caller's transaction, so the log cannot disagree with the data.
+	//
+	// The cost is one INSERT per transition on the payment hot path. That is what
+	// an audit trail costs; the alternative is a log with holes in exactly the
+	// cases anyone would want to investigate.
+	entry := &models.AuditLog{
+		ActorUserID: models.ActorFromContext(ctx),
+		EntityType:  "order",
+		EntityID:    strconv.FormatUint(orderID, 10),
+		Action:      "status_change",
+		Before:      statusSnapshot(from),
+		After:       statusSnapshot(to),
+	}
+	if err := r.Audit().Record(ctx, tx, entry); err != nil {
+		return false, fmt.Errorf("auditing order %d %s -> %s: %w", orderID, from, to, err)
+	}
+
 	return res.RowsAffected == 1, nil
+}
+
+// statusSnapshot renders a status for the before/after jsonb columns. Marshalling
+// a fixed one-field map cannot fail, so the error is dropped deliberately rather
+// than propagated up a path with no way to act on it.
+func statusSnapshot(s models.OrderStatus) []byte {
+	b, _ := json.Marshal(map[string]string{"status": string(s)})
+	return b
 }
 
 // Create inserts the order row. Items, reservations and the outbox event are
