@@ -33,15 +33,15 @@ func seedOrder(t *testing.T, db *gorm.DB, userID uint64, createdAt time.Time, st
 	return id
 }
 
-func seedUser(t *testing.T, db *gorm.DB, email string) uint64 {
-	t.Helper()
+func seedUser(tb testing.TB, db *gorm.DB, email string) uint64 {
+	tb.Helper()
 
 	var id uint64
 	err := db.Raw(`
 		INSERT INTO users (email, password_hash, name, role)
 		VALUES (?, 'x', 'Test User', 'CUSTOMER')
 		RETURNING id`, email).Scan(&id).Error
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	return id
 }
 

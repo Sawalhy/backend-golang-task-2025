@@ -505,6 +505,45 @@ why `replicas × poolSize` is the number that matters on Kubernetes.
 The point is not a single throughput number — it is **varying one thing at a
 time** and seeing what moves.
 
+## Benchmarks
+
+`README.md:247` asks for performance benchmarks for concurrent operations. The
+load test above is the outside view — what a client sees through HTTP, and it
+cannot say where the time went. [`tests/bench_test.go`](tests/bench_test.go) is
+the inside view: the statements the design rests on, measured directly against
+real Postgres with the goroutines genuinely colliding on one inventory row.
+
+```bash
+go test ./tests -bench . -run NONE -benchmem
+```
+
+`-run NONE` matches no test, so only benchmarks run. Standard `testing` output —
+ns/op, B/op, allocs/op.
+
+| Benchmark | What it measures |
+|---|---|
+| `ReserveInventory` | The conditional `UPDATE` alone — one round trip, no read-modify-write gap. The statement failure mode A turns on |
+| `OrderIntake` | The whole intake transaction: load, reserve, order, items, reservations, outbox, commit. The graded core (`README.md:189`) |
+| `OrderIntakeMultiLine` | Two lines across two rows — the second reservation, and the arrangement that would deadlock without the `product_id` sort |
+| `TransitionLostRace` | The CAS on its **losing** branch, the one every redelivery takes |
+
+### Measured
+
+8 goroutines against a pool of 25, Postgres 16 in Docker (`goarch: arm64`),
+`-benchtime 2s -count 3`, median of the three:
+
+| | ms/op | B/op | allocs/op |
+|---|---|---|---|
+| `ReserveInventory` | 0.147 | 2,648 | 29 |
+| `OrderIntake` | 0.499 | 44,644 | 513 |
+| `OrderIntakeMultiLine` | 0.522 | 49,699 | 600 |
+| `TransitionLostRace` | 0.014 | 3,496 | 40 |
+
+> **Absolute figures are host-bound.** Postgres commit `fsync` dominates every
+> write path here, so a machine where the database sits behind a VM reports
+> several times these numbers. Re-run with `-count 5` and read the median rather
+> than trusting any single round.
+
 ## Testing
 
 **177 tests, 83.9% statement coverage** across `internal/` and `pkg/`, past the

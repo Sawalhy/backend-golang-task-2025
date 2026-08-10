@@ -29,12 +29,12 @@ func newOrderSvc(store *repository.Store) *services.OrderService {
 	return services.NewOrderService(store, testOrderConfig(), logger.New("error", false))
 }
 
-func mustProduct(t *testing.T, store *repository.Store, sku string, priceCents int64, stock int) *models.Product {
-	t.Helper()
+func mustProduct(tb testing.TB, store *repository.Store, sku string, priceCents int64, stock int) *models.Product {
+	tb.Helper()
 
 	p, err := services.NewCatalogService(store).CreateProduct(context.Background(),
 		services.CreateProductInput{SKU: sku, Name: sku, PriceCents: priceCents, Stock: stock})
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	return p
 }
 
