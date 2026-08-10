@@ -120,10 +120,24 @@ deployment to one thing to build and promote.
 | Process | Runs |
 |---|---|
 | `cmd/api` | HTTP, plus an SSE backplane consumer for its own connections |
-| `cmd/worker` | Four queue consumers (payments, email, SMS, refunds) and four timers |
+| `cmd/worker` | Four queue consumers (payments, email, SMS, refunds) and five timers |
 | `cmd/relay` | Drains the outbox to RabbitMQ |
 
 Plus `cmd/migrate`, `cmd/seed` and `cmd/loadtest`.
+
+**This is a deviation from the tree at `README.md:120`**, which shows a single
+`cmd/server/main.go`. It is the async pipeline showing through: the whole design
+turns on payment running *outside* the request, in a process that can be scaled,
+restarted and starved of traffic independently of the API. Collapse the three
+back into one binary and there is nothing left to scale separately — the
+architecture becomes a decoration. `cmd/migrate` and `cmd/seed` are the same
+image with different entry points, so the cost of the split is one line in the
+Dockerfile, not three services to maintain.
+
+`pkg/utils` from that tree is also absent, deliberately. It had nothing to hold:
+what would have gone there is either domain logic (`internal/models`) or already
+a package with a real name (`pkg/database`, `pkg/logger`). A `utils` package is
+where cohesion goes to die, and an empty one is worse than none.
 
 The worker's two kinds of work are genuinely different. **Consumers react to
 events**; **timers react to the passage of time**, which is the only way to
@@ -133,6 +147,7 @@ notice that something did *not* happen:
 |---|---|---|
 | Reservation reaper | 30s | Stock held by abandoned checkouts |
 | Notification lease sweep | 60s | Sends abandoned by a dead worker |
+| Notification retry sweep | 30s | Sends whose transport failed |
 | Stuck-charge recovery + unknown reconciliation | 1m | Payments abandoned mid-flight |
 | Sales rollup | 1h (and once at startup) | Closed days, materialised |
 
@@ -299,6 +314,55 @@ completed resource and invite clients to treat the order as paid.
 
 Clients learn the outcome either by polling `GET /orders/{id}/status` or by
 subscribing to `GET /orders/{id}/events`.
+
+## Migrations: golang-migrate, not GORM AutoMigrate
+
+`README.md:30` asks for "database migrations using GORM". This is the one place
+the implementation knowingly does something else, so here is the reasoning.
+
+**The split.** `golang-migrate` runs once at startup — the `migrate` service in
+compose executes `migrations/000001_init.up.sql` and exits. GORM does everything
+else: every query in `internal/repository`, the connection pool, transactions,
+row mapping. GORM v2 is the ORM the spec asks for (`README.md:13`); it simply
+does not build the schema.
+
+**AutoMigrate cannot express this schema.** Not "is a worse way to" — cannot.
+Four things in `000001_init.up.sql` have no representation as struct tags:
+
+- `CREATE EXTENSION citext`, so `users.email` compares case-insensitively
+  without `lower()` defeating its unique index.
+- Five Postgres `ENUM` types. Not cosmetic — the repository casts against them
+  in SQL (`?::order_status`), which is what stops the server guessing a
+  parameter's type on a status comparison.
+- Partial indexes: `WHERE sent_at IS NULL`, `WHERE status = 'HELD'`. The
+  predicate is the entire point, as the next section explains.
+- The partial unique index on `payments`: one *live* intent per order, unlimited
+  dead ones. A plain unique index would forbid retrying a declined card.
+
+So the SQL gets hand-written either way. The only real question is whether it is
+versioned, ordered and reversible — which is all `golang-migrate` adds on top of
+the SQL you were going to write anyway.
+
+**AutoMigrate only adds.** It never drops a column, never narrows a type, has no
+down migration and no version history. A database that has been through five
+model revisions holds the union of all five and cannot tell you so. This is why
+the constraints live in the migration that creates the table: adding
+`CHECK (available >= 0)` later means first cleaning up the negative rows you
+already committed.
+
+**The tests decide it.** `tests/support_test.go` runs the real migration files,
+because the CHECK constraints and partial unique indexes *are* the invariants
+under test. `CHECK (available >= 0)` is the second guard against overselling —
+"The tests were checked for teeth" below records it refusing 24 writes that a
+deliberately broken `Reserve` allowed through. Under an AutoMigrate schema that
+constraint is absent, so the oversell test passes because today's application
+logic happens to be right, while proving nothing about the guarantee. That is a
+test that has quietly stopped testing.
+
+Worth noting that the requirement argues with itself: the same four-bullet list
+asks for "proper indexing strategy" (`README.md:29`) and "referential integrity
+and constraints" (`README.md:32`), which are precisely what AutoMigrate is
+weakest at. The choice was which bullet to honour, not whether to cut a corner.
 
 ## Indexing strategy
 
@@ -543,6 +607,37 @@ ns/op, B/op, allocs/op.
 > write path here, so a machine where the database sits behind a VM reports
 > several times these numbers. Re-run with `-count 5` and read the median rather
 > than trusting any single round.
+
+## Audit trail
+
+`README.md:63` requires an `AuditLogs` entity for tracking changes. Every order
+state change writes one, and the write lives inside `Transition` rather than at
+its eight call sites.
+
+That placement is the same argument as `Transition` itself. Every status change
+already funnels through one function, so putting the audit write there makes *no
+status change goes unrecorded* an invariant rather than something eight callers
+must remember — and the ninth caller, written next month, gets it for free. It
+joins the caller's transaction, so the log cannot disagree with the data it
+describes.
+
+**A lost CAS writes nothing.** `RowsAffected == 0` means another worker moved the
+order first; nothing changed, so there is nothing to record. Auditing attempts
+rather than changes would fill the table with transitions that never happened,
+which is how an audit trail becomes noise nobody reads.
+
+**The actor rides on the context.** The row is written in `internal/repository`,
+and the only layer that knows who is calling is the HTTP middleware. Threading an
+actor parameter down would touch service signatures with no interest in it —
+including the ones `cmd/worker` calls, where there is no user at all. So `Auth`
+puts the id on the request context and the repository reads it back
+(`internal/models/actor.go`). A worker-driven transition is attributed to nobody,
+which is why `actor_user_id` is nullable: the reaper expiring an abandoned
+checkout is not a person.
+
+The cost is one INSERT per transition on the payment hot path. That is what an
+audit trail costs; the alternative is a log with holes in exactly the cases
+anyone would want to investigate.
 
 ## Testing
 

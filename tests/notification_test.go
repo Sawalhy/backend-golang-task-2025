@@ -393,3 +393,131 @@ func TestDifferentKindsCoexist(t *testing.T) {
 	}
 	assert.True(t, kinds["confirmation"] && kinds["cancellation"])
 }
+
+// --- the retry sweep --------------------------------------------------------
+
+// notificationForChannel reads the one notification for an order and channel.
+// The sweep tests need to watch two channels move independently, which
+// notificationsFor's slice makes awkward.
+func notificationForChannel(t *testing.T, store *repository.Store, orderID uint64, channel string) models.Notification {
+	t.Helper()
+	for _, r := range notificationsFor(t, store, orderID) {
+		if r.Channel == channel {
+			return r
+		}
+	}
+	t.Fatalf("no %s notification for order %d", channel, orderID)
+	return models.Notification{}
+}
+
+// Failure mode I, the "never" half.
+//
+// TestFailedSendBecomesClaimableAgain above retries by handling a second
+// paidEvent, which re-claims the row by id. Production gets no such second
+// delivery: the broker message was acked the moment the handler returned. The
+// sweep is the only thing that can find the row again, and before it existed
+// the row sat at UNCLAIMED forever and the customer was simply never told.
+func TestFailedNotificationIsRetriedUntilItSends(t *testing.T) {
+	store, db := newStore(t)
+	ctx := context.Background()
+
+	orderID := newNotifiableOrder(t, store, db, "notify12@example.com")
+
+	notifier := newCountingNotifier("email")
+	notifier.failNext = 1
+	svc := services.NewNotificationService(store, notifier, time.Minute, logger.New("error", false))
+
+	// The event path: one send, and it fails.
+	require.NoError(t, svc.Handle(ctx, paidEvent(orderID)))
+
+	row := notificationForChannel(t, store, orderID, "email")
+	require.Equal(t, models.NotificationUnclaimed, row.Status,
+		"a failed send must leave the row claimable, not SENDING")
+	require.Equal(t, 1, row.Attempts)
+	require.Equal(t, 1, notifier.count())
+
+	// The sweep, with no second delivery anywhere in sight.
+	n, err := svc.RetryFailed(ctx, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "the sweep must claim the abandoned row")
+
+	row = notificationForChannel(t, store, orderID, "email")
+	assert.Equal(t, models.NotificationSent, row.Status, "the customer must eventually be told")
+	assert.Equal(t, 2, row.Attempts)
+	assert.Equal(t, 2, notifier.count())
+	assert.NotNil(t, row.SentAt)
+}
+
+// The budget has to be finite through the sweep too, or a permanently broken
+// transport is retried forever and the row never becomes visible as a problem.
+func TestNotificationRetriesStopAtTheAttemptBudget(t *testing.T) {
+	store, db := newStore(t)
+	ctx := context.Background()
+
+	orderID := newNotifiableOrder(t, store, db, "notify13@example.com")
+
+	notifier := newCountingNotifier("email")
+	notifier.failNext = 99 // never recovers
+	svc := services.NewNotificationService(store, notifier, time.Minute, logger.New("error", false))
+
+	require.NoError(t, svc.Handle(ctx, paidEvent(orderID)))
+
+	// Four more attempts spends the budget of five.
+	for i := 0; i < 4; i++ {
+		claimed, err := svc.RetryFailed(ctx, 10)
+		require.NoError(t, err)
+		require.Equal(t, 1, claimed, "attempt %d should still be claimable", i+2)
+	}
+
+	row := notificationForChannel(t, store, orderID, "email")
+	assert.Equal(t, models.NotificationFailed, row.Status)
+	assert.Equal(t, 5, row.Attempts)
+	assert.Equal(t, 5, notifier.count())
+	require.NotNil(t, row.LastError)
+
+	// And it must stay out of the pool rather than being picked up forever.
+	claimed, err := svc.RetryFailed(ctx, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 0, claimed, "a spent row must not be claimed again")
+	assert.Equal(t, 5, notifier.count(), "and must not be sent again")
+}
+
+// The sweep is per-channel because a service owns exactly one transport. Without
+// the channel filter the email worker claims SMS rows and sends them down the
+// wrong pipe — and the SMS worker then finds nothing to do.
+func TestRetrySweepClaimsOnlyItsOwnChannel(t *testing.T) {
+	store, db := newStore(t)
+	ctx := context.Background()
+
+	orderID := newNotifiableOrder(t, store, db, "notify14@example.com")
+
+	emailNotifier := newCountingNotifier("email")
+	emailNotifier.failNext = 1
+	smsNotifier := newCountingNotifier("sms")
+	smsNotifier.failNext = 1
+
+	log := logger.New("error", false)
+	emailSvc := services.NewNotificationService(store, emailNotifier, time.Minute, log)
+	smsSvc := services.NewNotificationService(store, smsNotifier, time.Minute, log)
+
+	require.NoError(t, emailSvc.Handle(ctx, paidEvent(orderID)))
+	require.NoError(t, smsSvc.Handle(ctx, paidEvent(orderID)))
+
+	// Two separate rows, both failed, both waiting.
+	require.Equal(t, models.NotificationUnclaimed, notificationForChannel(t, store, orderID, "email").Status)
+	require.Equal(t, models.NotificationUnclaimed, notificationForChannel(t, store, orderID, "sms").Status)
+
+	claimed, err := emailSvc.RetryFailed(ctx, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, claimed, "email sweep claims exactly its own row")
+
+	assert.Equal(t, models.NotificationSent, notificationForChannel(t, store, orderID, "email").Status)
+	assert.Equal(t, models.NotificationUnclaimed, notificationForChannel(t, store, orderID, "sms").Status,
+		"the SMS row must be untouched by the email sweep")
+	assert.Equal(t, 1, smsNotifier.count(), "the SMS transport must not have been used")
+
+	claimed, err = smsSvc.RetryFailed(ctx, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, claimed)
+	assert.Equal(t, models.NotificationSent, notificationForChannel(t, store, orderID, "sms").Status)
+}

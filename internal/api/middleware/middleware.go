@@ -131,6 +131,14 @@ func Auth(auth *services.AuthService) gin.HandlerFunc {
 
 		c.Set(CtxUserID, claims.UserID)
 		c.Set(CtxRole, string(claims.Role))
+
+		// Also on the request context, so the layers that must not import Gin can
+		// still attribute the change they are about to make. This is what puts a
+		// user id on the audit row for an admin fulfilment or a customer
+		// cancellation, while a worker-driven transition stays attributed to
+		// nobody.
+		c.Request = c.Request.WithContext(models.WithActor(c.Request.Context(), claims.UserID))
+
 		c.Next()
 	}
 }
