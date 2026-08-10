@@ -3,7 +3,7 @@
 > What every test asserts, how it is built, and — for the ones that matter — why
 > it is written the way it is rather than the obvious way.
 
-**175 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
+**178 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
 plus the rate limiter), and pure unit tests where no infrastructure is needed.
 
 | File | Tests | Covers | Needs |
@@ -29,6 +29,7 @@ plus the rate limiter), and pure unit tests where no infrastructure is needed.
 | `pkg/logger/logger_test.go` | 5 | Trace id propagation | — |
 | `tests/repository_test.go` | 5 | Live-intent lookup, audit atomicity | Postgres |
 | `tests/failure_paths_test.go` | 8 | Rollback under injected DB failure, retry classification | Postgres |
+| `tests/sweep_test.go` | 3 | Rollback at EVERY step of intake, cancel and reap (18 subtests) | Postgres |
 
 ---
 
@@ -594,6 +595,59 @@ transient and replaying usually works, while a constraint violation means an
 invariant **held** and replaying produces the identical result. Getting that
 backwards turns a lost race into an infinite loop.
 
+### Sweeps — failing every step, not a chosen one
+
+The tests above pick a step and prove the rollback holds *there*. A sweep runs the
+same operation once per position, failing a **different** step each time, and
+asserts the same invariant after every one.
+
+```go
+for n := 1; n <= 12; n++ {
+    t.Run(fmt.Sprintf("fail_at_call_%d", n), func(t *testing.T) {
+        faults.FailNthCall("", n, errInjected)
+        _, err := orders.Create(ctx, input)
+        faults.disarm()
+        require.Error(t, err)
+        assertIntakeLeftNothing(t, store, db, productID)
+    })
+}
+```
+
+Each position is a **subtest**, so a failure names the step rather than leaving
+you to bisect:
+
+```
+--- FAIL: TestIntakeRollsBackAtEveryStep/fail_at_call_4
+```
+
+Positions past the operation's real call count skip, and the parent asserts a
+minimum number actually fired — so the sweep cannot silently stop doing anything
+if the code changes shape.
+
+| Sweep | Positions exercised |
+|---|---|
+| `TestIntakeRollsBackAtEveryStep` | 6 — products, order, inventory, items, reservations, outbox |
+| `TestCancelRollsBackAtEveryStep` | 6 |
+| `TestReaperRollsBackAtEveryStep` | 6 |
+
+**What this guards that the picked-step tests cannot.** Rollback itself is
+Postgres's job. What is *ours* is that the work is inside a transaction at all,
+that errors propagate, and that nothing escapes the transaction's reach. A sweep
+catches three changes a future edit could make:
+
+- a step moved **outside** the transaction
+- an error **swallowed** — a missing `return`, a discarded `_ =`
+- a **non-transactional side effect** added: a cache write, an HTTP call, a
+  direct publish
+
+That last one is the reason these earn their keep. It silently reintroduces
+failure mode B — the dual write the outbox exists to eliminate — and it is
+exactly the change someone makes without realising. No other test in the suite
+would notice.
+
+The coverage gain is incidental and small: each position covers one `return err`.
+The invariant is the point.
+
 ### A failure that is genuinely real
 
 Everything above injects a synthetic error — the database never actually failed,
@@ -670,14 +724,14 @@ go tool cover -func=coverage.out
 | `internal/repository` | 81.8% | Hot paths, outbox, notifications, leases, listings |
 
 *(Per-package figures are the mean of per-function percentages, so they are
-indicative rather than exact; the 82.6% total is statement-weighted.)*
+indicative rather than exact; the 83.9% total is statement-weighted.)*
 
 **Past the >80% the brief asks for at `README.md:164`, and every package is
 individually above it** — so the number is not one well-covered package carrying
 several thin ones.
 
 The figure is worth reading with its history, though. It went 44.8% → 54.8% →
-71.6% → 77.1% → 82.6%, and the steps that mattered were not the ones that moved
+71.6% → 77.1% → 82.6% → 83.9%, and the steps that mattered were not the ones that moved
 it most. Writing the payment saga tests found two real bugs; writing the refund
 consumer tests closed the largest correctness gap in the system and moved the
 number barely at all. Coverage is a useful prompt for *where to look next*. It is
@@ -812,7 +866,7 @@ Context on what moved, and why the number is not the point:
 | `internal/models` 87.0% | 100% | State machine reachability, enum round-trips |
 | `pkg/logger` 58.0% | 100% | Trace id propagation |
 | `pkg/database` 75.0% | 91.7% | Error classification through wrapped errors |
-| **total 44.8%** | **82.6%** | |
+| **total 44.8%** | **83.9%** | |
 
 Several of those found real defects rather than moving a percentage: the
 worker-death recovery gap, the reconciliation CAS that abandoned half its work,
