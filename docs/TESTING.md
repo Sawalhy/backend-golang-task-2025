@@ -3,7 +3,7 @@
 > What every test asserts, how it is built, and — for the ones that matter — why
 > it is written the way it is rather than the obvious way.
 
-**167 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
+**175 tests.** Integration against real Postgres, RabbitMQ and Redis (`tests/`,
 plus the rate limiter), and pure unit tests where no infrastructure is needed.
 
 | File | Tests | Covers | Needs |
@@ -28,6 +28,7 @@ plus the rate limiter), and pure unit tests where no infrastructure is needed.
 | `pkg/database/database_test.go` | 4 | Error classification through wrapping | — |
 | `pkg/logger/logger_test.go` | 5 | Trace id propagation | — |
 | `tests/repository_test.go` | 5 | Live-intent lookup, audit atomicity | Postgres |
+| `tests/failure_paths_test.go` | 8 | Rollback under injected DB failure, retry classification | Postgres |
 
 ---
 
@@ -76,7 +77,7 @@ loaded gun left for whoever maintains this next, traded for coverage of branches
 that are almost entirely `if err != nil { return fmt.Errorf("...: %w", err) }`,
 where the assertion is that Go propagates errors.
 
-**If those branches are wanted, fault injection is the better tool** — see §12.1.
+**Those branches are now covered by fault injection instead** — see §10.
 Because we own Postgres in tests we can make it genuinely fail, which exercises
 the same branches with real semantics and without opening the seam.
 
@@ -535,7 +536,79 @@ The third is the outbox earning its keep. Nothing is lost across a reconnect
 because unpublished rows still have `sent_at IS NULL`, so the next session claims
 the same batch.
 
-## 10. Running it
+## 10. Failure paths — `failure_paths_test.go` + `faults_test.go`
+
+What happens when the database fails part-way through an operation. The
+assertion in every case is **not** "an error came back" — that only proves Go
+propagates errors. It is **"nothing was left behind."**
+
+### How the faults are injected
+
+GORM implements its own features as a chain of named callbacks per operation —
+`gorm:begin_transaction`, `gorm:create`, `gorm:query`, `gorm:commit_or_rollback`.
+That chain is an extension point, occupying the same position as EF Core's
+`DbCommandInterceptor` or middleware in an HTTP pipeline. The whole plugin
+interface is two methods:
+
+```go
+type Plugin interface {
+    Name() string
+    Initialize(*DB) error
+}
+```
+
+`faultInjector` registers a callback *before* the one that actually executes,
+and when armed calls `db.AddError(...)`. GORM then propagates it exactly as if
+the driver had returned it.
+
+**Why this rather than mocking a repository.** A mock replaces the repository, so
+everything below the seam disappears — the SQL, GORM, the driver, the
+transaction. A callback leaves all of it in place and makes the *real* thing
+fail, so the error travels the production path: the repository wraps it,
+`database.IsRetryable` classifies it, `InTx` decides replay-or-return, the
+service branches, the handler maps a status code.
+
+**And it changes no production code.** The plugin is installed on the test
+connection only; `database.Open` never registers it. Adding repository
+interfaces would change every service signature *and* open the seam that makes
+the oversell test mockable — see §1.
+
+> **Sharp edge:** the matcher is a substring, so a fault armed on `"outbox"` also
+> matches `SELECT count(*) FROM outbox`. A still-armed rule fails the test's own
+> verification queries rather than the code under test. Disarm before asserting.
+
+| Test | Asserts |
+|---|---|
+| `TestIntakeRollsBackEntirelyWhenInventoryFails` | No order, no items, no reservations, **no event**, stock untouched |
+| `TestIntakeRollsBackWhenTheOutboxWriteFails` | An order whose event cannot be written must not exist — failure mode B from the inside |
+| `TestDeadlockIsRetriedAndSucceeds` | A `40P01` is replayed and the operation **succeeds**, reserving stock exactly once |
+| `TestConstraintViolationIsNotRetried` | A unique violation surfaces on the **first** attempt — replaying it would hang |
+| `TestRetriesAreBounded` | A fault that never clears gives up after the budget, and says so |
+| `TestReaperRollsBackOnFailure` | A half-reaped order releases no stock; the reservation stays `HELD` for the next sweep |
+| `TestPaymentSettlementRollsBackWhenTheEventFails` | No `PAID` order without its `order.paid` event |
+
+`TestDeadlockIsRetriedAndSucceeds` and `TestConstraintViolationIsNotRetried` are
+the pair worth reading together. They exercise the retry *classification* end to
+end with errors Postgres would really produce: a serialization conflict is
+transient and replaying usually works, while a constraint violation means an
+invariant **held** and replaying produces the identical result. Getting that
+backwards turns a lost race into an infinite loop.
+
+### A failure that is genuinely real
+
+Everything above injects a synthetic error — the database never actually failed,
+so those tests exercise *our handling*, not Postgres's behaviour.
+
+`TestConnectionKilledMidTransactionRollsBack` closes that gap. It reserves stock
+inside a transaction, reads its own `pg_backend_pid()`, and then — **from a
+second connection** — calls `pg_terminate_backend` on itself. Postgres aborts the
+transaction while it holds row locks; no `COMMIT` is possible. The assertion is
+that the reservation left no trace, read back through the surviving connection.
+
+That is rollback with the exact semantics production would see, rather than an
+error a test author invented.
+
+## 11. Running it
 
 ```bash
 # With Go installed — testcontainers provides Postgres
@@ -564,7 +637,7 @@ concurrency tests against real Postgres say that.
 
 ---
 
-## 11. Coverage
+## 12. Coverage
 
 **71.6% of statements**, measured across `internal/` and `pkg/`:
 
@@ -591,20 +664,20 @@ go tool cover -func=coverage.out
 | `internal/api/middleware` | 95.3% | Auth via the HTTP tests, limiter directly |
 | `internal/api/routes` | 91.7% | Wiring, fully walked by the HTTP fixtures |
 | `pkg/database` | 91.7% | Error classification through wrapped errors |
-| `internal/services` | 88.0% | Intake, saga, refunds, reaper, rollup, notifications, provider |
+| `internal/services` | 88.2% | Intake, saga, refunds, reaper, rollup, notifications, provider |
 | `internal/api/handlers` | 84.2% | Every endpoint, table-driven |
-| `internal/workers` | 82.7% | Relay, backplane, consumers, supervisor |
-| `internal/repository` | 80.7% | Hot paths, outbox, notifications, leases, listings |
+| `internal/workers` | 81.8% | Relay, backplane, consumers, supervisor |
+| `internal/repository` | 81.8% | Hot paths, outbox, notifications, leases, listings |
 
 *(Per-package figures are the mean of per-function percentages, so they are
-indicative rather than exact; the 82.1% total is statement-weighted.)*
+indicative rather than exact; the 82.6% total is statement-weighted.)*
 
 **Past the >80% the brief asks for at `README.md:164`, and every package is
 individually above it** — so the number is not one well-covered package carrying
 several thin ones.
 
 The figure is worth reading with its history, though. It went 44.8% → 54.8% →
-71.6% → 77.1% → 82.1%, and the steps that mattered were not the ones that moved
+71.6% → 77.1% → 82.6%, and the steps that mattered were not the ones that moved
 it most. Writing the payment saga tests found two real bugs; writing the refund
 consumer tests closed the largest correctness gap in the system and moved the
 number barely at all. Coverage is a useful prompt for *where to look next*. It is
@@ -629,7 +702,7 @@ That said, the gap is real and closable. The cheapest wins, in order:
 3. **`internal/repository`** — targeted tests for the listing and admin queries
    that the hot paths never touch.
 
-## 12. What is not covered, and why
+## 13. What is not covered, and why
 
 Two buckets remain, both deliberate. They are listed with what closing them would
 cost, because "untested" without a reason is just an apology.
@@ -638,42 +711,18 @@ cost, because "untested" without a reason is just an apology.
 > loops — are now covered; see §9.6 and §9.7. The supervisor tests kill the
 > connection from the broker side via the management API rather than needing a
 > `SIGKILL`, which turned out to be both faster and more deterministic. What a
-> real `SIGKILL` would still add is noted in §12.3.
+> real `SIGKILL` would still add is noted in §13.2.
 
-### 12.1 Error branches — needs fault injection
+### 13.1 Error branches — now covered by fault injection
 
-**~250 statements**, spread thinly across every file as
-`if err != nil { return err }`. These fire only when the database itself fails
-mid-transaction: a dropped connection, a full disk, a cancelled context at an
-awkward moment.
+*(This bucket used to say these branches were unreachable without mocking. That
+was wrong on both counts — see §10.)*
 
-There are two ways to reach them, and they are not equally good.
+The remaining uncovered statements are the residue: `if err != nil` paths on
+operations no test happens to fail, plus a few unreachable-in-practice branches
+like a `nil` statement guard. What was worth reaching is reached.
 
-**Interface seams and a mock.** Add consumer-side interfaces for the repositories
-and substitute a double that returns errors. Cheap to write — but it opens the
-seam that lets someone write the oversell test against a mock, where it passes
-trivially. See §1 for why that trade is bad.
-
-**Fault injection into the real database.** Better, because it needs no
-production change at all and produces a *real* failure rather than a fake one:
-
-| Technique | Reaches |
-|---|---|
-| A GORM plugin that errors on the Nth query | Any specific statement in a sequence — a seam at the driver, not the architecture |
-| `SET statement_timeout = '1ms'` | Genuine query timeouts, with real cancellation semantics |
-| `pg_terminate_backend` mid-transaction | Rollback under a connection that actually died |
-| toxiproxy in front of Postgres | Latency, partial writes, connection resets |
-
-`pg_terminate_backend` is the interesting one: it tests rollback with the exact
-semantics production would see, rather than an error a test author invented.
-
-**Even so, this is the bucket I would leave for last.** The branches are one line
-each and uniform, the risk they carry is low, and coverage percentage is the
-wrong reason to build the machinery. But if the goal is confidence rather than a
-number — specifically, confidence that a mid-transaction failure rolls back
-cleanly — the fault-injection route is worth it and the mocking route is not.
-
-### 12.2 What a real `SIGKILL` would still add
+### 13.2 What a real `SIGKILL` would still add
 
 The supervisor tests kill the *connection*. They do not kill a *process*, and
 there is one thing only that can demonstrate:
@@ -703,7 +752,7 @@ process scheduling, so it belongs behind a build tag rather than on every save.
 Worth doing eventually. It is no longer the largest gap, because the reconnect
 path it was mainly wanted for is now covered directly.
 
-### 12.3 Not worth testing
+### 13.3 Not worth testing
 
 - **`cmd/*` entry points.** Wiring only. The logic they wire is covered, and a
   test would assert that the code is shaped the way it is shaped.
@@ -725,7 +774,7 @@ path it was mainly wanted for is now covered directly.
 Closing the first two would put coverage in the mid-eighties. Closing the third
 would push it higher and make the suite worse.
 
-## 13. The refund consumer — `refund_test.go`
+## 14. The refund consumer — `refund_test.go`
 
 Worth its own section because it was the most consequential gap in the suite, and
 it had nothing to do with infrastructure.
@@ -750,7 +799,7 @@ money in the direction nobody complains about — paying a customer back twice.
 The last one is the full compensation loop, which previously stopped at the
 outbox row.
 
-## 14. Recently closed
+## 15. Recently closed
 
 Context on what moved, and why the number is not the point:
 
@@ -763,7 +812,7 @@ Context on what moved, and why the number is not the point:
 | `internal/models` 87.0% | 100% | State machine reachability, enum round-trips |
 | `pkg/logger` 58.0% | 100% | Trace id propagation |
 | `pkg/database` 75.0% | 91.7% | Error classification through wrapped errors |
-| **total 44.8%** | **82.1%** | |
+| **total 44.8%** | **82.6%** | |
 
 Several of those found real defects rather than moving a percentage: the
 worker-death recovery gap, the reconciliation CAS that abandoned half its work,
