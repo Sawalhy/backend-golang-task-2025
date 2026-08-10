@@ -82,12 +82,16 @@ type OrderConfig struct {
 }
 
 type WorkerConfig struct {
-	Concurrency     int
-	ReaperInterval  time.Duration
-	RelayInterval   time.Duration
-	RelayBatchSize  int
-	NotifyLeaseTTL  time.Duration
-	ShutdownTimeout time.Duration
+	Concurrency    int
+	ReaperInterval time.Duration
+	RelayInterval  time.Duration
+	RelayBatchSize int
+	NotifyLeaseTTL time.Duration
+	// NotifyRetryInterval paces the re-drive of notifications whose send failed.
+	// It is the backoff between attempts, not merely a polling rate: five
+	// attempts fired in a tight loop would all hit the same outage.
+	NotifyRetryInterval time.Duration
+	ShutdownTimeout     time.Duration
 }
 
 type PaymentsConfig struct {
@@ -140,12 +144,13 @@ func Load() (*Config, error) {
 			DeadlockRetries:  envInt("DEADLOCK_RETRIES", 3),
 		},
 		Worker: WorkerConfig{
-			Concurrency:     envInt("WORKER_CONCURRENCY", 10),
-			ReaperInterval:  envDur("REAPER_INTERVAL", 30*time.Second),
-			RelayInterval:   envDur("RELAY_INTERVAL", 500*time.Millisecond),
-			RelayBatchSize:  envInt("RELAY_BATCH_SIZE", 100),
-			NotifyLeaseTTL:  envDur("NOTIFY_LEASE_TTL", 60*time.Second),
-			ShutdownTimeout: envDur("WORKER_SHUTDOWN_TIMEOUT", 30*time.Second),
+			Concurrency:         envInt("WORKER_CONCURRENCY", 10),
+			ReaperInterval:      envDur("REAPER_INTERVAL", 30*time.Second),
+			RelayInterval:       envDur("RELAY_INTERVAL", 500*time.Millisecond),
+			RelayBatchSize:      envInt("RELAY_BATCH_SIZE", 100),
+			NotifyLeaseTTL:      envDur("NOTIFY_LEASE_TTL", 60*time.Second),
+			NotifyRetryInterval: envDur("NOTIFY_RETRY_INTERVAL", 30*time.Second),
+			ShutdownTimeout:     envDur("WORKER_SHUTDOWN_TIMEOUT", 30*time.Second),
 		},
 		Payments: PaymentsConfig{
 			Provider:             env("PAYMENT_PROVIDER", "simulated"),

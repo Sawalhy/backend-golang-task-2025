@@ -84,7 +84,52 @@ func (r *NotificationRepo) MarkSent(ctx context.Context, tx *gorm.DB, id uint64)
 	return nil
 }
 
-// MarkFailed records a permanent failure after the attempt budget is spent.
+// ClaimRetryable takes a batch of notifications whose send failed and whose
+// attempt budget is not yet spent.
+//
+// This is the other half of MarkFailed. A failed send returns the row to
+// UNCLAIMED, but the broker delivery that produced it has already been acked —
+// the message is gone, and without this scan nothing would ever look at the row
+// again. That is failure mode I's "never" half: the customer is simply not told.
+//
+// Scoped to one channel because a NotificationService owns exactly one notifier.
+// Without the filter the email worker would claim SMS rows and send them down
+// the wrong transport.
+//
+// The predicate matches the notif_claimable partial index. FOR UPDATE SKIP
+// LOCKED lets several workers sweep at once without claiming the same row, the
+// same mechanism the relay uses on the outbox.
+func (r *NotificationRepo) ClaimRetryable(ctx context.Context, channel string, lease time.Duration, maxAttempts, limit int) ([]models.Notification, error) {
+	var out []models.Notification
+	err := r.db.WithContext(ctx).Raw(`
+		UPDATE notifications
+		   SET status      = 'SENDING',
+		       lease_until = now() + (? * interval '1 second'),
+		       attempts    = attempts + 1
+		 WHERE id IN (
+		   SELECT id FROM notifications
+		    WHERE status   = 'UNCLAIMED'
+		      AND channel  = ?
+		      AND attempts < ?
+		    ORDER BY id
+		    FOR UPDATE SKIP LOCKED
+		    LIMIT ?)
+		RETURNING *`,
+		lease.Seconds(), channel, maxAttempts, limit).Scan(&out).Error
+	if err != nil {
+		return nil, fmt.Errorf("claiming retryable %s notifications: %w", channel, err)
+	}
+	return out, nil
+}
+
+// MarkFailed records the outcome of a failed send: back to UNCLAIMED while the
+// attempt budget lasts, permanently FAILED once it is spent.
+//
+// Returning the row to UNCLAIMED is only useful because ClaimRetryable scans for
+// it. Note that it is deliberately NOT left as SENDING with an expired lease —
+// that would work too, via ReleaseExpiredLeases, but it would mean a row whose
+// send has already returned is indistinguishable from one whose worker died
+// mid-flight, and only the second deserves the lease timeout's grace.
 func (r *NotificationRepo) MarkFailed(ctx context.Context, tx *gorm.DB, id uint64, reason string, maxAttempts int) error {
 	res := r.txOrDB(tx).WithContext(ctx).Exec(`
 		UPDATE notifications

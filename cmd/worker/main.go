@@ -138,10 +138,30 @@ func run() error {
 	})
 
 	// Reclaims notification rows abandoned by a worker that died mid-send.
+	// ReleaseExpiredLeases is channel-agnostic, so one service sweeping covers
+	// both email and SMS rows — running it per-service would only duplicate work.
 	g.Go(func() error {
 		return everyTick(gctx, cfg.Worker.NotifyLeaseTTL, func(ctx context.Context) {
 			if err := email.SweepExpiredLeases(ctx); err != nil {
 				log.Error("sweeping notification leases", "error", err)
+			}
+		})
+	})
+
+	// Re-drives notifications whose send failed. This one IS per-channel: a
+	// service only knows how to send down its own transport.
+	//
+	// Without it a failed send is terminal. MarkFailed returns the row to
+	// UNCLAIMED, but the broker delivery that produced it was acked the moment
+	// the handler returned, so no redelivery is coming and nothing else scans for
+	// the row — the customer is simply never told. The absence of an email is not
+	// an event, so only a timer can notice it.
+	g.Go(func() error {
+		return everyTick(gctx, cfg.Worker.NotifyRetryInterval, func(ctx context.Context) {
+			for _, n := range []*services.NotificationService{email, sms} {
+				if _, err := n.RetryFailed(ctx, 100); err != nil {
+					log.Error("retrying failed notifications", "error", err)
+				}
 			}
 		})
 	})

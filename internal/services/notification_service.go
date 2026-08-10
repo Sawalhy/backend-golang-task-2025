@@ -91,19 +91,72 @@ func (s *NotificationService) Handle(ctx context.Context, ev models.Envelope) er
 		// there is nothing for this delivery to do.
 		return nil
 	}
+	// Ensure read the row before Claim incremented the counter, so the in-memory
+	// copy is one behind the database. Corrected here rather than re-read, so the
+	// log line reports the attempt that is actually about to happen.
+	notification.Attempts++
 
-	// Step 2: send. Outside any transaction — this is a network call, and
-	// holding a row lock across it is the mistake rule 4 exists to prevent.
-	sendErr := s.notifier.Send(ctx, channel, kind, orderID)
+	// Steps 2 and 3: send, then record the outcome.
+	return s.deliver(ctx, notification)
+}
 
-	// Step 3: record the outcome.
+// RetryFailed re-drives notifications whose send failed and whose attempt budget
+// is not yet spent, returning how many it attempted.
+//
+// This exists because the event-driven path cannot retry itself: by the time a
+// send fails, the broker delivery has been acked and the message is gone. The
+// row is left UNCLAIMED, and only a scan can find it again — the same reason the
+// reaper is a timer rather than a consumer. Nothing publishes an event to
+// announce that an email did not arrive.
+//
+// The caller's tick interval IS the backoff. Retrying in a tight loop would burn
+// all five attempts inside a second, which for a transport that is briefly down
+// means five failures and a permanently FAILED row.
+func (s *NotificationService) RetryFailed(ctx context.Context, limit int) (int, error) {
+	channel := s.notifier.Channel()
+
+	rows, err := s.store.Notifications().ClaimRetryable(ctx, channel, s.lease, maxNotificationAttempts, limit)
+	if err != nil {
+		return 0, err
+	}
+
+	for i := range rows {
+		// Sequential on purpose. This is a backlog of things that already failed;
+		// draining it fast enough to compete with live traffic for pool
+		// connections would make a transport blip into a database problem.
+		if err := s.deliver(ctx, &rows[i]); err != nil {
+			// One row failing to record its outcome must not abandon the rest —
+			// they hold live leases and would otherwise wait out the full TTL.
+			s.log.ErrorContext(ctx, "recording notification retry outcome",
+				"notification_id", rows[i].ID, "channel", channel, "error", err)
+		}
+	}
+
+	if len(rows) > 0 {
+		s.log.InfoContext(ctx, "retried failed notifications", "channel", channel, "count", len(rows))
+	}
+	return len(rows), nil
+}
+
+// deliver sends a claimed notification and records what happened. Shared by the
+// event path and the retry sweep, so a failure is recorded identically however
+// the row was claimed — the divergence that let retries go missing in the first
+// place.
+//
+// The send is outside any transaction: it is a network call, and holding a row
+// lock across it is the mistake rule 4 exists to prevent.
+func (s *NotificationService) deliver(ctx context.Context, n *models.Notification) error {
+	sendErr := s.notifier.Send(ctx, n.Channel, n.Kind, n.OrderID)
+
 	return s.store.InTx(ctx, func(ctx context.Context, tx *gorm.DB) error {
 		if sendErr != nil {
 			s.log.WarnContext(ctx, "notification send failed",
-				"order_id", orderID, "channel", channel, "attempt", notification.Attempts, "error", sendErr)
-			return s.store.Notifications().MarkFailed(ctx, tx, notification.ID, sendErr.Error(), maxNotificationAttempts)
+				"order_id", n.OrderID, "channel", n.Channel,
+				"attempt", n.Attempts, "max_attempts", maxNotificationAttempts,
+				"error", sendErr)
+			return s.store.Notifications().MarkFailed(ctx, tx, n.ID, sendErr.Error(), maxNotificationAttempts)
 		}
-		return s.store.Notifications().MarkSent(ctx, tx, notification.ID)
+		return s.store.Notifications().MarkSent(ctx, tx, n.ID)
 	})
 }
 
