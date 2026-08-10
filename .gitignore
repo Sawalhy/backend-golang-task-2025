@@ -13,3 +13,11 @@ coverage.html
 
 # Local run logs
 *.log
+
+# Working notes, not deliverables. These are the design log, the build order and
+# the agent instructions — written to drive the work, not to be read by anyone
+# assessing it. The submission is README.md, SOLUTION.md and docs/TESTING.md.
+/CLAUDE.md
+/docs/DESIGN_NOTES.md
+/docs/IMPLEMENTATION.md
+/.claude/
