@@ -59,6 +59,20 @@ Three processes, one binary image. They scale independently — API replicas tra
 request load, workers track queue depth — while a single artifact keeps
 deployment to one thing to build and promote.
 
+**This is a deviation from the tree at `README.md:120`**, which shows a single
+`cmd/server/main.go`. It is the async pipeline showing through: the whole design
+turns on payment running *outside* the request, in a process that can be scaled,
+restarted and starved of traffic independently of the API. Collapse the three
+back into one binary and there is nothing left to scale separately — the
+architecture becomes a decoration. `cmd/migrate` and `cmd/seed` are the same
+image with different entry points, so the cost of the split is one line in the
+Dockerfile, not three services to maintain.
+
+`pkg/utils` from that tree is also absent, deliberately. It had nothing to hold:
+what would have gone there is either domain logic (`internal/models`) or already
+a package with a real name (`pkg/database`, `pkg/logger`). A `utils` package is
+where cohesion goes to die, and an empty one is worse than none.
+
 **Order intake is one transaction:** reserve stock with a conditional `UPDATE`,
 insert the order, items and reservations, insert the outbox event. Commit. Return
 202. Payment happens afterwards in a worker with **no transaction open and no
@@ -146,6 +160,55 @@ The spec leaves these open. Each was decided rather than guessed at.
 | **`PUT /orders/{id}/cancel`** is not RESTful | Implemented exactly as specified (`README.md:86`). Noting that it was noticed: a cancellation is a resource, so `POST /orders/{id}/cancellation` would be better. |
 | **Job state visibility** | RabbitMQ is transport, not storage — once a message is acked the broker cannot say what became of it. `GET /orders/{id}/status` reads payment attempt history from Postgres. |
 | **Real-time inventory** | Not pushed. See "Not built" below. |
+
+## Migrations: golang-migrate, not GORM AutoMigrate
+
+`README.md:30` asks for "database migrations using GORM". This is the one place
+the implementation knowingly does something else, so here is the reasoning.
+
+**The split.** `golang-migrate` runs once at startup — the `migrate` service in
+compose executes `migrations/000001_init.up.sql` and exits. GORM does everything
+else: every query in `internal/repository`, the connection pool, transactions,
+row mapping. GORM v2 is the ORM the spec asks for (`README.md:13`); it simply
+does not build the schema.
+
+**AutoMigrate cannot express this schema.** Not "is a worse way to" — cannot.
+Four things in `000001_init.up.sql` have no representation as struct tags:
+
+- `CREATE EXTENSION citext`, so `users.email` compares case-insensitively
+  without `lower()` defeating its unique index.
+- Five Postgres `ENUM` types. Not cosmetic — the repository casts against them
+  in SQL (`?::order_status`), which is what stops the server guessing a
+  parameter's type on a status comparison.
+- Partial indexes: `WHERE sent_at IS NULL`, `WHERE status = 'HELD'`. The
+  predicate is the entire point, as the next section explains.
+- The partial unique index on `payments`: one *live* intent per order, unlimited
+  dead ones. A plain unique index would forbid retrying a declined card.
+
+So the SQL gets hand-written either way. The only real question is whether it is
+versioned, ordered and reversible — which is all `golang-migrate` adds on top of
+the SQL you were going to write anyway.
+
+**AutoMigrate only adds.** It never drops a column, never narrows a type, has no
+down migration and no version history. A database that has been through five
+model revisions holds the union of all five and cannot tell you so. This is why
+the constraints live in the migration that creates the table: adding
+`CHECK (available >= 0)` later means first cleaning up the negative rows you
+already committed.
+
+**The tests decide it.** `tests/support_test.go` runs the real migration files,
+because the CHECK constraints and partial unique indexes *are* the invariants
+under test. `CHECK (available >= 0)` is the second guard against overselling —
+"The tests were checked for teeth" below records it refusing 24 writes that a
+deliberately broken `Reserve` allowed through. Under an AutoMigrate schema that
+constraint is absent, so the oversell test passes because today's application
+logic happens to be right, while proving nothing about the guarantee. That is a
+test that has quietly stopped testing.
+
+Worth noting that the requirement argues with itself: the same four-bullet list
+asks for "proper indexing strategy" (`README.md:29`) and "referential integrity
+and constraints" (`README.md:32`), which are precisely what AutoMigrate is
+weakest at. The choice was which bullet to honour, not whether to cut a corner.
 
 ## Indexing strategy
 
@@ -358,6 +421,37 @@ connection open for an event that can never arrive.
 **Inventory is still not pushed** — that half of `README.md:110-114` is
 deliberately not built, and the reasoning is in "What is not built".
 
+## Audit trail
+
+`README.md:63` requires an `AuditLogs` entity for tracking changes. Every order
+state change writes one, and the write lives inside `Transition` rather than at
+its eight call sites.
+
+That placement is the same argument as `Transition` itself. Every status change
+already funnels through one function, so putting the audit write there makes *no
+status change goes unrecorded* an invariant rather than something eight callers
+must remember — and the ninth caller, written next month, gets it for free. It
+joins the caller's transaction, so the log cannot disagree with the data it
+describes.
+
+**A lost CAS writes nothing.** `RowsAffected == 0` means another worker moved the
+order first; nothing changed, so there is nothing to record. Auditing attempts
+rather than changes would fill the table with transitions that never happened,
+which is how an audit trail becomes noise nobody reads.
+
+**The actor rides on the context.** The row is written in `internal/repository`,
+and the only layer that knows who is calling is the HTTP middleware. Threading an
+actor parameter down would touch service signatures with no interest in it —
+including the ones `cmd/worker` calls, where there is no user at all. So `Auth`
+puts the id on the request context and the repository reads it back
+(`internal/models/actor.go`). A worker-driven transition is attributed to nobody,
+which is why `actor_user_id` is nullable: the reaper expiring an abandoned
+checkout is not a person.
+
+The cost is one INSERT per transition on the payment hot path. That is what an
+audit trail costs; the alternative is a log with holes in exactly the cases
+anyone would want to investigate.
+
 ## Testing
 
 With Go installed locally:
@@ -383,9 +477,9 @@ pointing it at `orders` would wipe the running stack.
 Integration tests run the real migration files, not `AutoMigrate`, because the
 CHECK constraints and partial unique indexes *are* the invariants under test.
 
-Current state: **47 passing** — 12 payment saga (failure modes C, D, E),
-7 oversell/concurrency, 7 reaper, 7 rollup, 4 SSE, 3 backplane, plus 7 hub unit
-tests (the hub set clean under `-race`).
+Current state: **54 passing** — 12 payment saga (failure modes C, D, E),
+7 oversell/concurrency, 7 reaper, 7 rollup, 4 SSE, 4 audit, 3 notification
+retry, 3 backplane, plus 7 hub unit tests (the hub set clean under `-race`).
 
 The saga tests cover what happens when things die. A cancel racing a live charge
 is a timing bug, so the fake provider has a **gate** that holds the charge
@@ -448,9 +542,11 @@ Stated plainly, because silence reads as unfinished.
   protocol solves a problem order status does not have. This forfeits a bonus
   tick; the justification is worth more.
 
-## Two bugs the failure-mode tests found
+## Three bugs the failure-mode work turned up
 
 Writing tests for node death turned up two defects that reading the code did not.
+The third arrived the other way round — spotted by reading the acknowledgement
+path, then pinned down by the tests that reproduce it.
 
 **A worker dying mid-charge stranded the order forever.** `ProcessOrder` skips
 any order that is not `PENDING`, so a process SIGKILLed between the
@@ -478,6 +574,40 @@ in `CHARGING` with its stock held. The success path worked only because
 
 Both were caught by a test asserting the end state, not the call sequence —
 which is the argument for testing what the system *is* rather than what it *did*.
+
+**A notification whose send failed was never retried.** This one was live in
+every run: the demo transports fail 5% of sends, so roughly one notification in
+twenty was being dropped in silence.
+
+`MarkFailed` returns a failed row to `UNCLAIMED` while its attempt budget lasts,
+which reads as obviously correct — `UNCLAIMED` is the claimable state. But by
+then the handler has returned nil, so the broker delivery is **acked** and no
+redelivery is coming. The only other thing that touches these rows,
+`ReleaseExpiredLeases`, matches `status = 'SENDING' AND lease_until < now()` — so
+an `UNCLAIMED` row with a `NULL` lease satisfies neither half of the predicate.
+Nothing in the codebase scanned for it.
+
+The row therefore sat there forever. `attempts` could never exceed 1, the budget
+of five was unreachable, status `FAILED` was unreachable, and the
+`notif_claimable` partial index served a scan nobody performed. This is failure
+mode I's "never" half, alive inside the service whose own doc comment explains
+how it prevents exactly that.
+
+The irony is the fix's best clue: leaving the row `SENDING` with a dead lease
+would have worked, because the lease sweeper would have found it. Choosing the
+state that *sounds* more claimable is what made it invisible.
+
+`ClaimRetryable` performs the scan the index was always shaped for, and
+`RetryFailed` drives it from a periodic loop in the worker — a timer, not a
+consumer, for the same reason as the reaper: no message is ever published to
+announce that an email did not arrive. It is scoped per channel, because a
+service owns exactly one transport and would otherwise claim SMS rows and send
+them as email. The tick interval is the backoff rather than a poll rate; five
+attempts fired in a tight loop would all hit the same outage and burn the budget
+in under a second.
+
+All three fixes were mutation-tested. Pointing `ClaimRetryable` at `SENDING`
+rows reproduces the original bug and all three notification tests go red.
 
 ## A bug that only running it would find
 
