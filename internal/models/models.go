@@ -132,6 +132,11 @@ type Outbox struct {
 	CreatedAt  time.Time  `                           json:"created_at"`
 	SentAt     *time.Time `gorm:"column:sent_at"     json:"sent_at,omitempty"`
 	Attempts   int        `gorm:"column:attempts"    json:"attempts"`
+	// TraceID is the W3C traceparent of the request that produced this event.
+	// The relay copies it onto the AMQP message so the consumer's span joins the
+	// originating request's trace — the only way to correlate two processes that
+	// share no call stack. Empty when tracing is disabled.
+	TraceID string `gorm:"column:trace_id" json:"trace_id,omitempty"`
 }
 
 func (Outbox) TableName() string { return "outbox" }

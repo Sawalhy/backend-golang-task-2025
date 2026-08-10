@@ -21,6 +21,9 @@ rather than `depends_on` alone, so a clean clone works with no manual steps.
 | Swagger UI | `http://localhost:8080/swagger/index.html` (or `/docs`) |
 | RabbitMQ management | `http://localhost:15672` — guest / guest |
 | Health | `GET /healthz` (liveness), `GET /readyz` (readiness) |
+| Prometheus | `http://localhost:9090` — try Status ▸ Targets, then Alerts |
+| Jaeger | `http://localhost:16686` — pick service `order-processing-api` |
+| Metrics | `:8080/metrics` (api), `:9101/metrics` (worker), `:9102/metrics` (relay) |
 
 Seeded accounts:
 
@@ -88,9 +91,10 @@ role checks, Redis token-bucket rate limiting, panic recovery, input validation,
 Swagger/OpenAPI, golang-migrate migrations, connection pooling, graceful
 shutdown on SIGTERM.
 
-**Bonus taken:** RabbitMQ, load testing (`cmd/loadtest`), and Kubernetes
-manifests (`deployments/k8s`, reasoning in its own README). **Bonus not taken:**
-Prometheus, tracing, WebSocket — see [What is not built](#what-is-not-built).
+**Bonus taken:** RabbitMQ, load testing (`cmd/loadtest`), Kubernetes manifests
+(`deployments/k8s`, reasoning in its own README), and **Prometheus metrics plus
+distributed tracing** — see [Observability](#observability). **Bonus not taken:**
+WebSocket — see [What is not built](#what-is-not-built).
 
 **One deliberate deviation from the brief.** `README.md:30` says "Database
 migrations using GORM". Migrations run through **golang-migrate** instead, and
@@ -500,6 +504,8 @@ The ones that change behaviour under load:
 | `RESERVATION_TTL` | 15m | Too short fails slow payments; too long starves buyers |
 | `PAYMENT_FAILURE_RATE` / `_TIMEOUT_RATE` | 0.10 / 0.02 | Deliberately non-zero so declines and the `UNKNOWN` path are reachable in a demo |
 | `WORKER_SHUTDOWN_TIMEOUT` | 30s | Must exceed the longest in-flight job |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | Empty disables span **export**, not tracing — ids are still generated and still propagate. Compose sets `jaeger:4318` |
+| `METRICS_ADDR` | `:9100` | Worker and relay only; the api serves `/metrics` on `HTTP_PORT` |
 
 ## API documentation
 
@@ -639,6 +645,171 @@ The cost is one INSERT per transition on the payment hot path. That is what an
 audit trail costs; the alternative is a log with holes in exactly the cases
 anyone would want to investigate.
 
+## Observability
+
+Two bonus items, `README.md:257-258`. Both are built around one observation,
+and it is the reason this section exists at all:
+
+> **Every failure mode this system has leaves all eight containers healthy and
+> every endpoint returning 200.**
+
+A stranded order, a worker dying mid-charge, a payment nobody knows the outcome
+of — none of them fail a health check. `/readyz` is green throughout. So health
+checks are not the instrument; these are.
+
+### Distributed tracing — one id that survives the async gap
+
+The hard part is not the SDK. It is that `POST /orders` and the payment that
+fulfils it are **separate processes running minutes apart with no call stack
+between them**. An in-process tracer cannot bridge that, so the trace context is
+written down and travels with the work:
+
+```
+POST /orders          trace b6754aac…   ← span opens at the API edge
+  └─ INSERT outbox      trace_id stored as a COLUMN on the row   ← the crucial bit
+       └─ relay           reads it back into the AMQP traceparent header
+            └─ consumer     resumes it as a REMOTE parent; every log line carries it
+```
+
+`outbox.trace_id` (migration `000002`) is what makes it work — the same move as
+everything else here: the network cannot carry causality across a crash, but a
+committed row can. Proof it holds: the run below strands an event for two minutes
+with the broker down, and the trace still assembles when it drains.
+
+The trace id is also the **logged** `trace_id` and the `X-Request-ID` response
+header. That is deliberate — a uuid for logs alongside an unrelated OTel trace id
+means two ids per request and a human joining them by timestamp mid-incident.
+
+A real order, read out of Jaeger:
+
+```
+POST /api/v1/orders             api      8.7ms   ← client released here, 202
+└─ outbox publish order.created   relay    5.6ms
+   └─ consume payments              worker 221.0ms   ← the charge
+      └─ outbox publish order.paid    relay    1.1ms
+         ├─ consume notifications.email  worker  52.6ms
+         └─ consume notifications.sms    worker  32.9ms
+```
+
+That waterfall is [reserve → pay → commit](#2-reserve--pay--commit) made visible:
+the client is released in 8.7 ms while the charge takes 221 ms. Email and SMS
+appear as siblings because both queues bind `order.paid` — the topology, drawn
+from the outside.
+
+**Export is optional; tracing is not.** `OTEL_EXPORTER_OTLP_ENDPOINT` empty (the
+default) disables shipping spans, but ids are still generated and still propagate,
+so `go test` and `go run` need no Jaeger and the correlation path is the same code
+in every environment rather than one that only exists where a collector does.
+
+### Metrics — one instrument per failure mode
+
+`/metrics` on all three processes. The worker and relay are not HTTP services, but
+Prometheus only scrapes, so each runs a metrics-only listener — and that matters:
+**almost every metric below is produced by the worker or relay, not the api.** An
+api-only scrape shows a healthy system while the pipeline behind it is wedged.
+
+| Failure mode | Metric | Alerts when |
+|---|---|---|
+| B — committed, never queued | `outbox_oldest_unsent_seconds` | > 60s for 1m |
+| E — worker died mid-job | `jobs_reclaimed_total` | any sustained rate |
+| C — outcome unknown | `payments_unknown` | > 0 for 5m |
+| F — stock held hostage | `reservations_expired_total` | rate spike |
+| G — lock-order violation | `deadlock_retries_total` | above baseline |
+| J — pool exhaustion | `db_pool_in_use / db_pool_max` | > 80% for 5m |
+| — | `up` | scrape failing for 2m |
+
+Rules in [`docker/alerts.yml`](docker/alerts.yml). Seven, kept short on purpose:
+an alert nobody acts on trains everyone to ignore alerts.
+
+**Age, not depth.** `outbox_pending_rows` can sit at 3 forever while one poison
+row never leaves, so the mode B alarm measures *the age of the oldest unsent row*.
+Read as a pair, the two gauges name the fault: both climbing is a dead relay or an
+unreachable broker; count flat while age climbs is a single row blocking the queue
+behind it.
+
+**Two honest caveats.**
+
+The instruments are package-level vars, so importing `pkg/metrics` registers all
+of them in all three binaries — the api publishes `outbox_oldest_unsent_seconds`
+as a permanent, meaningless `0` because only the relay ever sets it. Every alert
+rule is therefore scoped by `component`, and `TargetDown` is what actually catches
+a process that has stopped reporting, since a stale series triggers nothing.
+Registering per-process would be tidier and was not worth the wiring here.
+
+`/metrics` is unauthenticated, like the probes. The scraper is infrastructure with
+no user identity, and the alternatives end in a shared secret in a scrape config.
+It exposes route names and counts, never order or customer data, and belongs on an
+internal listener rather than the public ingress — a deployment concern, not the
+router's.
+
+### Verifying it
+
+Everything below was run against `docker compose up --build`; the outputs quoted
+in this section come from that run.
+
+**Traces.** Place an order, then follow it end to end. The response header *is*
+the trace id:
+
+```bash
+curl -si localhost:8080/api/v1/orders -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"items":[{"product_id":1,"qty":1}]}' | grep -i x-request-id
+```
+
+Open that id in Jaeger at `http://localhost:16686`, or assert the cross-process
+claim directly in SQL — the `order.paid` rows are written by the **worker**, and
+carry the trace id of the original **API** request:
+
+```bash
+docker compose exec postgres psql -U postgres -d orders -c "SELECT id, routing_key, trace_id FROM outbox ORDER BY id;"
+```
+
+```
+ id |  routing_key  |                        trace_id
+----+---------------+---------------------------------------------------------
+  1 | order.created | 00-b6754aac71b16d56742ac34b8e0d9025-b5593409fcb96a0e-01
+  5 | order.paid    | 00-b6754aac71b16d56742ac34b8e0d9025-87742dbafa336e19-01
+```
+
+Same trace, different spans, two processes and one commit boundary apart.
+
+**Metrics and alerts.** Targets and rules:
+
+```bash
+curl -s 'localhost:9090/api/v1/targets?state=active' | jq -r '.data.activeTargets[] | "\(.labels.job) \(.health)"'
+```
+
+**Firing an alarm on purpose** — the one that proves mode B is observable. Stop
+the broker and place an order: intake still returns **202**, because the event is
+committed to the outbox in the order's own transaction, and the relay stays up
+reporting lag it cannot drain.
+
+```bash
+docker compose stop rabbitmq
+```
+
+Place an order, wait ~2 minutes, then check `http://localhost:9090/alerts`:
+
+```
+ALERT  OutboxStranded [firing]  component=relay severity=critical
+  summary: Oldest unpublished event is 2m 0s old
+```
+
+Bring it back and the system heals itself — the backlog drains, the order reaches
+`PAID`, and the alert clears:
+
+```bash
+docker compose start rabbitmq
+```
+
+```
+t+015s  unsent=1  order4=PAID  OutboxStranded=firing
+t+030s  unsent=0  order4=PAID  OutboxStranded=firing
+t+060s  unsent=0  order4=PAID  OutboxStranded=inactive
+```
+
+Nothing was lost, and the stranded event's trace still assembled across the
+two-minute gap — which is the whole argument for storing the traceparent on the
+row rather than holding it in memory.
+
 ## Testing
 
 **177 tests, 83.9% statement coverage** across `internal/` and `pkg/`, past the
@@ -702,7 +873,14 @@ Stated plainly, because silence reads as unfinished.
   order" as two steps. This forfeits half of `README.md:110-114` deliberately.
 - **WebSocket** — a bidirectional protocol solves a problem order status does
   not have. This forfeits a bonus tick; the justification is worth more.
-- **Prometheus and distributed tracing** — the remaining bonus items.
+- **Log aggregation (Loki/ELK).** Logs are structured JSON carrying the trace id,
+  which is the part that matters; shipping them to a query engine is deployment
+  work that would demonstrate nothing further here. `docker compose logs worker |
+  jq 'select(.trace_id=="…")'` covers it at this scale.
+- **Span-per-database-call.** Spans mark process boundaries only. Per-query spans
+  triple the span count to answer a question `pg_stat_statements` already answers
+  better, and in an async pipeline the time disappears between processes, not
+  inside them.
 - **A real `SIGKILL` test.** Process death is reproduced at the database level
   rather than by killing a subprocess, and connection loss is reproduced by
   force-closing the connection from the broker side. What neither shows directly

@@ -9,15 +9,23 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/models"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/services"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/logger"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/tracing"
 )
 
 // Context keys for values the middleware chain puts on the request.
@@ -27,27 +35,90 @@ const (
 	CtxTraceID = "trace.id"
 )
 
-// RequestID assigns a trace id and threads it through ctx, so every log line
-// emitted anywhere below this point correlates to one request without each call
-// site remembering to pass it.
+// RequestID opens the request's trace span and threads its id through ctx, so
+// every log line emitted anywhere below this point correlates to one request
+// without each call site remembering to pass it.
 //
-// An inbound X-Request-ID is honoured so a trace survives across services.
+// Tracing and the log trace id are deliberately ONE mechanism, not two. Running
+// a uuid for logs alongside an unrelated OpenTelemetry trace id gives two ids
+// for one request and forces a human mid-incident to join them by timestamp.
+// The span is started here, and its trace id becomes the logged trace_id — so a
+// waterfall in Jaeger and the log lines describing it share a single string.
+//
+// Precedence: an inbound W3C traceparent continues that trace; otherwise an
+// inbound X-Request-ID is honoured so a caller can still correlate; otherwise a
+// fresh uuid. With tracing disabled there is no valid trace id and this collapses
+// to exactly the previous behaviour.
 func RequestID(base *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := c.GetHeader("X-Request-ID")
+		// FullPath is the ROUTE PATTERN (/api/v1/orders/:id), not the URL. Span
+		// names and metric labels built from the raw path would mint a new series
+		// per order id and eventually take the tracing backend down with them.
+		route := c.FullPath()
+		if route == "" {
+			route = "unmatched"
+		}
+
+		// Extract before starting: a traceparent on the inbound request makes this
+		// span a child of the caller's, which is what stitches services together.
+		ctx := otel.GetTextMapPropagator().Extract(
+			c.Request.Context(), propagation.HeaderCarrier(c.Request.Header))
+
+		ctx, span := tracing.Tracer().Start(ctx, c.Request.Method+" "+route,
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithAttributes(
+				attribute.String("http.request.method", c.Request.Method),
+				attribute.String("http.route", route),
+			))
+		defer span.End()
+
+		id := tracing.TraceID(ctx)
 		if id == "" {
-			id = uuid.NewString()
+			if id = c.GetHeader("X-Request-ID"); id == "" {
+				id = uuid.NewString()
+			}
 		}
 
 		c.Set(CtxTraceID, id)
 		c.Header("X-Request-ID", id)
 
 		// Replace the request's context so handlers and everything they call
-		// receive the trace-tagged logger via ctx, not via a global.
-		ctx := logger.WithTraceID(c.Request.Context(), base, id)
-		c.Request = c.Request.WithContext(ctx)
+		// receive the trace-tagged logger and the span via ctx, not via a global.
+		c.Request = c.Request.WithContext(logger.WithTraceID(ctx, base, id))
 
 		c.Next()
+
+		status := c.Writer.Status()
+		span.SetAttributes(attribute.Int("http.response.status_code", status))
+		// Only 5xx marks the span errored. A 409 from insufficient stock is the
+		// system working correctly, and colouring it red trains everyone to ignore
+		// red spans.
+		if status >= 500 {
+			span.SetStatus(codes.Error, http.StatusText(status))
+		}
+	}
+}
+
+// Metrics records the RED metrics for every request.
+//
+// Placed outside auth and rate limiting in the chain so a 401 or a 429 is still
+// counted — those are exactly the responses you want a rate on when something is
+// wrong, and a limiter that starts rejecting everything would otherwise make the
+// traffic simply disappear from the dashboard.
+func Metrics() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		route := c.FullPath()
+		if route == "" {
+			route = "unmatched"
+		}
+		start := time.Now()
+
+		c.Next()
+
+		metrics.HTTPDuration.WithLabelValues(c.Request.Method, route).
+			Observe(time.Since(start).Seconds())
+		metrics.HTTPRequests.WithLabelValues(c.Request.Method, route,
+			strconv.Itoa(c.Writer.Status())).Inc()
 	}
 }
 

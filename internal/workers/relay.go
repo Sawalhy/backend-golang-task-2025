@@ -6,9 +6,14 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/repository"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/tracing"
 )
 
 // Relay drains the outbox into RabbitMQ.
@@ -107,7 +112,28 @@ func (r *Relay) DrainOnce(ctx context.Context) (int, error) {
 
 		sent := make([]uint64, 0, len(rows))
 		for _, row := range rows {
-			if err := r.pub.PublishConfirmed(ctx, row.RoutingKey, row.EventID.String(), row.Payload); err != nil {
+			// Resume the trace the ORDER REQUEST started, not the relay's own. The
+			// publish then hangs under the POST that caused it, minutes later and
+			// in a different process, which is the entire point of storing the
+			// traceparent on the row.
+			pubCtx, span := tracing.Tracer().Start(
+				tracing.WithTraceparent(ctx, row.TraceID),
+				"outbox publish "+row.RoutingKey,
+				trace.WithSpanKind(trace.SpanKindProducer),
+				trace.WithAttributes(
+					attribute.String("messaging.system", "rabbitmq"),
+					attribute.String("messaging.destination.name", row.RoutingKey),
+					attribute.String("messaging.message.id", row.EventID.String()),
+				))
+
+			err := r.pub.PublishConfirmed(pubCtx, row.RoutingKey, row.EventID.String(), row.Payload)
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+			}
+			span.End()
+
+			if err != nil {
 				// Stop at the first failure. Marking the ones already confirmed
 				// is still correct, and the rest stay unsent for the next pass.
 				r.log.Error("publish failed, deferring remainder",
@@ -165,5 +191,12 @@ func ReportOutboxLag(ctx context.Context, store *repository.Store, log *slog.Log
 		log.Error("reading outbox lag", "error", err)
 		return
 	}
+
+	// The same two numbers the log line carries, published for Prometheus. Read
+	// as a PAIR: both climbing is a dead relay or an unreachable broker, count
+	// flat while age climbs is a single poison row blocking the queue behind it.
+	metrics.OutboxPendingRows.Set(float64(pending))
+	metrics.OutboxOldestUnsentSeconds.Set(age.Seconds())
+
 	log.Info("outbox lag", "pending", pending, "oldest_age_seconds", age.Seconds())
 }

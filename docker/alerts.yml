@@ -1,0 +1,116 @@
+# Alert rules, one per failure mode in DESIGN_NOTES §4.
+#
+# These exist because of the observation the whole observability section turns on:
+#
+#   Every failure mode in §4 leaves all eight containers healthy and every
+#   endpoint returning 200.
+#
+# A liveness probe cannot see a stranded outbox row, a worker dying mid-charge,
+# or a payment whose outcome nobody knows. These can.
+#
+# Kept to seven deliberately. An alert nobody acts on trains everyone to ignore
+# alerts, so anything without an obvious response is a dashboard panel instead.
+#
+# Every rule is SCOPED BY component, and that is not cosmetic. The instruments
+# live in one package, so importing it registers all of them in all three
+# binaries — the api and worker both publish outbox_oldest_unsent_seconds, and
+# both report a permanent, meaningless 0 for it because only the relay ever sets
+# it. Unscoped, a dashboard shows three lines where one is real, and a rule reads
+# a number its process does not measure. Scope each rule to the process that
+# owns the number, and pair it with TargetDown, which is what actually catches a
+# component that has stopped reporting at all.
+
+groups:
+  - name: order-pipeline
+    rules:
+      # Mode B — order committed, event never published.
+      #
+      # AGE, not depth. outbox_pending_rows can sit at 3 forever while one poison
+      # row never leaves; a count-based alert is blind to exactly that case.
+      - alert: OutboxStranded
+        expr: outbox_oldest_unsent_seconds{component="relay"} > 60
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Oldest unpublished event is {{ $value | humanizeDuration }} old"
+          description: >-
+            The relay is not draining. Orders are committed but nothing is
+            processing them. Both gauges climbing means the relay is down or the
+            broker is unreachable; the count flat while the age climbs means one
+            poison row is blocking everything behind it.
+
+      # Mode E — processes dying mid-job. The replacement pod is healthy, so
+      # nothing else reports this.
+      - alert: JobsBeingReclaimed
+        expr: sum(rate(jobs_reclaimed_total{component="worker"}[5m])) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Leases expiring — workers are dying mid-job"
+          description: >-
+            Work is being reclaimed from processes that stopped existing. Steady
+            non-zero means crashes or OOM kills, not a transient restart.
+
+      # Mode C — the "we may have charged them" pile. Not a retry's problem.
+      - alert: PaymentsUnknown
+        expr: payments_unknown{component="worker"} > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $value }} payment(s) with an unconfirmed outcome"
+          description: >-
+            The provider never confirmed these. The reconciliation sweep asks it
+            what happened; anything still here after several minutes means the
+            sweep is failing and a human has to decide.
+
+      # Mode F — stock reclaimed from abandoned checkouts. Baseline is normal;
+      # a spike is not.
+      - alert: ReservationsExpiringFast
+        expr: rate(reservations_expired_total{component="worker"}[10m]) > 0.5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Reservations expiring at {{ $value | printf \"%.2f\" }}/s"
+          description: >-
+            Stock is being reclaimed faster than usual. Customers getting bored
+            and payments quietly failing look identical in the orders table —
+            check the payment failure rate before assuming demand.
+
+      # Mode G — deadlocks are prevented by sorting line items on product_id, so
+      # anything sustained means a write path bypassed the sort.
+      - alert: DeadlockRetriesElevated
+        expr: rate(deadlock_retries_total[5m]) > 0.1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Transactions retrying on deadlock"
+          description: >-
+            Lock ordering should make these nearly impossible. A sustained rate
+            means some path touches inventory without sorting by product_id.
+
+      # Mode J — the pool is the first thing to run out under a burst, and it
+      # runs out silently.
+      - alert: DBPoolSaturated
+        expr: db_pool_in_use / db_pool_max > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Connection pool {{ $value | humanizePercentage }} used on {{ $labels.component }}"
+          description: >-
+            Requests are about to start queueing on connection acquisition.
+            Remember the pool is PER PROCESS — N replicas multiply it against
+            Postgres max_connections.
+
+      # Not a failure mode from §4, but the one that makes the rest trustworthy.
+      # Every rule above reads a series a process publishes; a process that has
+      # stopped publishing triggers none of them, because its series simply goes
+      # stale. This is the alert that notices the silence.
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }} has stopped reporting"
+          description: >-
+            Prometheus cannot scrape this component. Until it comes back, every
+            other alert here is blind to whatever it measures.

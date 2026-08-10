@@ -99,6 +99,9 @@ services:
       REDIS_ADDR: redis:6379
       JWT_SECRET: dev-secret-change-me-in-production-0123456789
       DB_MAX_OPEN_CONNS: "12"
+      # Serves /metrics on the main port; only worker and relay need METRICS_ADDR.
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
+      OTEL_SERVICE_NAME: order-processing
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -130,6 +133,11 @@ services:
       # reachable in a demo rather than only in tests.
       PAYMENT_FAILURE_RATE: "0.10"
       PAYMENT_TIMEOUT_RATE: "0.02"
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
+      OTEL_SERVICE_NAME: order-processing
+      METRICS_ADDR: ":9100"
+    ports:
+      - "9101:9100"  # /metrics — mapped off 9100 so relay can use it too
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -153,6 +161,11 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       RELAY_INTERVAL: "500ms"
       RELAY_BATCH_SIZE: "100"
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
+      OTEL_SERVICE_NAME: order-processing
+      METRICS_ADDR: ":9100"
+    ports:
+      - "9102:9100"  # /metrics — this is where the mode B alarm comes from
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -161,6 +174,32 @@ services:
     stop_grace_period: 20s
     # Safe to scale: rows are claimed with FOR UPDATE SKIP LOCKED, so two relays
     # never publish the same event.
+
+  # --- observability (README.md:257-258 bonus) ------------------------------
+  #
+  # Both are ephemeral on purpose: no volumes, no retention tuning. They exist so
+  # the metrics and traces the app emits can be SEEN, which is the deliverable —
+  # a durable monitoring estate is not.
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # UI — search by trace id, or by service "order-processing-api"
+      - "4318:4318"    # OTLP/HTTP, the endpoint the three binaries export to
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"    # UI: try outbox_oldest_unsent_seconds, or Status > Targets
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on:
+      - api
+      - worker
+      - relay
 
 volumes:
   pgdata:

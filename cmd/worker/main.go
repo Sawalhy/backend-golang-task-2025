@@ -29,6 +29,8 @@ import (
 	"github.com/Sawalhy/backend-golang-task-2025/internal/workers"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/database"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/logger"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/tracing"
 )
 
 func main() {
@@ -48,6 +50,22 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The worker is where the trace resumes: spans started here attach to the
+	// remote parent carried on the AMQP message, so a charge shows up under the
+	// POST /orders that caused it minutes earlier.
+	shutdownTracing, err := tracing.Init(ctx, cfg.Observe.ServiceName+"-worker", cfg.Observe.OTLPEndpoint)
+	if err != nil {
+		log.Warn("tracing disabled", "error", err)
+		shutdownTracing = func(context.Context) error { return nil }
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			log.Warn("flushing traces", "error", err)
+		}
+	}()
+
 	db, err := database.Open(ctx, database.Options{
 		DSN:             cfg.DB.DSN,
 		MaxOpenConns:    cfg.DB.MaxOpenConns,
@@ -59,6 +77,10 @@ func run() error {
 		return err
 	}
 	defer func() { _ = database.Close(db) }()
+
+	if sqlDB, err := db.DB(); err == nil {
+		metrics.RegisterDBPool(sqlDB)
+	}
 
 	store := repository.New(db, cfg.Order.DeadlockRetries)
 
@@ -78,6 +100,12 @@ func run() error {
 		cfg.Worker.NotifyLeaseTTL, log)
 
 	g, gctx := errgroup.WithContext(ctx)
+
+	// Prometheus can only scrape, and the worker is not an HTTP service — so it
+	// gets a listener carrying nothing but /metrics. The numbers that matter most
+	// (leases reclaimed, stock reaped, unknown payments) are all produced here,
+	// and without this they would exist only in log lines nobody aggregates.
+	g.Go(func() error { return metrics.Serve(gctx, cfg.Observe.MetricsAddr, log) })
 
 	// --- consumers ----------------------------------------------------------
 	// Each queue gets its own consumer with its own bounded pool. Email and SMS

@@ -7,10 +7,25 @@ import (
 	"log/slog"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/models"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/logger"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/tracing"
 )
+
+// traceparentOf reads the W3C header the relay put on the message. A message
+// published before tracing existed, or by a producer that does not trace, simply
+// has no header — the consumer starts a fresh trace rather than failing.
+func traceparentOf(d amqp.Delivery) string {
+	if tp, ok := d.Headers[HeaderTraceparent].(string); ok {
+		return tp
+	}
+	return ""
+}
 
 // Handler processes one event. Returning nil acks the delivery.
 //
@@ -73,14 +88,43 @@ func RunConsumer(ctx context.Context, b *Broker, queue string, prefetch, concurr
 }
 
 func handleDelivery(ctx context.Context, d amqp.Delivery, queue string, h Handler, log *slog.Logger) {
+	// Rejoin the trace that started at the API edge. The parent span belongs to a
+	// different process that finished minutes ago, so this is a REMOTE parent
+	// reconstructed from the header the relay copied off the outbox row — there
+	// is no call stack to inherit it from.
+	ctx = tracing.WithTraceparent(ctx, traceparentOf(d))
+	ctx, span := tracing.Tracer().Start(ctx, "consume "+queue,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "rabbitmq"),
+			attribute.String("messaging.source.name", queue),
+		))
+	defer span.End()
+
+	// Put the trace id on the context's logger so every line the handler and the
+	// services below it emit carries it — without each call site remembering to.
+	// This is what makes a trace in Jaeger and the logs explaining it findable
+	// from one another by the same string.
+	traceID := tracing.TraceID(ctx)
+	log = log.With("trace_id", traceID)
+	ctx = logger.WithTraceID(ctx, log, traceID)
+
 	var ev models.Envelope
 	if err := json.Unmarshal(d.Body, &ev); err != nil {
 		// Unparseable will never become parseable. Straight to the DLQ rather
 		// than round-tripping forever.
 		log.Error("discarding unparseable message", "queue", queue, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "unparseable message")
 		_ = d.Nack(false, false)
 		return
 	}
+
+	span.SetAttributes(
+		attribute.String("event.id", ev.EventID.String()),
+		attribute.String("event.type", ev.EventType),
+		attribute.Int64("order.id", int64(ev.Aggregate.ID)),
+	)
 
 	l := log.With("queue", queue, "event_id", ev.EventID, "event_type", ev.EventType,
 		"order_id", ev.Aggregate.ID)
@@ -91,6 +135,8 @@ func handleDelivery(ctx context.Context, d amqp.Delivery, queue string, h Handle
 		// Redelivered flag is what bounds it without needing a counter.
 		requeue := !d.Redelivered
 		l.Error("handler failed", "error", err, "requeue", requeue)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		_ = d.Nack(false, requeue)
 		return
 	}

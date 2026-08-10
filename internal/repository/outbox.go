@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/models"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/tracing"
 )
 
 type OutboxRepo struct{ *Store }
@@ -39,10 +40,15 @@ func (r *OutboxRepo) Enqueue(ctx context.Context, tx *gorm.DB, ev models.Envelop
 		return uuid.Nil, fmt.Errorf("marshalling %s payload: %w", ev.EventType, err)
 	}
 
+	// Captured here, inside the caller's transaction, because this is the last
+	// point at which the originating request is still on the stack. By the time
+	// the relay reads this row the request is long gone, so a trace context not
+	// written down now is unrecoverable.
 	row := models.Outbox{
 		EventID:    ev.EventID,
 		RoutingKey: ev.EventType,
 		Payload:    body,
+		TraceID:    tracing.Traceparent(ctx),
 	}
 	if err := r.txOrDB(tx).WithContext(ctx).Create(&row).Error; err != nil {
 		return uuid.Nil, fmt.Errorf("enqueuing %s: %w", ev.EventType, err)

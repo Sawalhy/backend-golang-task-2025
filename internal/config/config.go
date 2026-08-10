@@ -26,6 +26,21 @@ type Config struct {
 	Order    OrderConfig
 	Worker   WorkerConfig
 	Payments PaymentsConfig
+	Observe  ObserveConfig
+}
+
+// ObserveConfig covers the two bonus items at README.md:257-258.
+type ObserveConfig struct {
+	// ServiceName distinguishes api/worker/relay in the trace waterfall. Each
+	// entry point overrides it, since all three share one binary image.
+	ServiceName string
+	// OTLPEndpoint is host:port of the collector. EMPTY DISABLES EXPORT, and that
+	// is the default on purpose: `go test` and `go run` must not require a running
+	// Jaeger. Trace ids are still generated and still propagate either way.
+	OTLPEndpoint string
+	// MetricsAddr is the listener for the worker and relay, which have no HTTP
+	// server of their own. The api serves /metrics on its main port instead.
+	MetricsAddr string
 }
 
 type HTTPConfig struct {
@@ -158,6 +173,13 @@ func Load() (*Config, error) {
 			SimulatedTimeoutRate: envFloat("PAYMENT_TIMEOUT_RATE", 0.02),
 			SimulatedLatency:     envDur("PAYMENT_LATENCY", 200*time.Millisecond),
 			Timeout:              envDur("PAYMENT_TIMEOUT", 5*time.Second),
+		},
+		Observe: ObserveConfig{
+			// OTEL_* are the names the OpenTelemetry spec reserves, so an operator
+			// who has configured any other OTel service already knows these.
+			ServiceName:  env("OTEL_SERVICE_NAME", "order-processing"),
+			OTLPEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+			MetricsAddr:  env("METRICS_ADDR", ":9100"),
 		},
 	}
 
