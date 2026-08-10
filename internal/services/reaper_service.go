@@ -8,6 +8,7 @@ import (
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/models"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/repository"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
 )
 
 // ReaperService reclaims stock held by orders that were never paid for
@@ -104,6 +105,10 @@ func (s *ReaperService) ReapOnce(ctx context.Context) (int, error) {
 	}
 
 	if expired > 0 {
+		// A spike here means payments are failing, not that customers got bored
+		// (failure mode F) — the two look identical in the order table and only
+		// the rate of this counter separates them.
+		metrics.ReservationsExpired.Add(float64(expired))
 		s.log.InfoContext(ctx, "reclaimed stock from expired orders", "orders", expired)
 	}
 	return expired, nil

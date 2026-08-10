@@ -20,6 +20,7 @@ import (
 	"github.com/Sawalhy/backend-golang-task-2025/internal/api/middleware"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/config"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/services"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
 )
 
 type Deps struct {
@@ -51,6 +52,7 @@ func Build(d Deps) *gin.Engine {
 	r.Use(
 		middleware.Recovery(d.Log),
 		middleware.RequestID(d.Log),
+		middleware.Metrics(),
 		middleware.Logging(d.Log),
 	)
 
@@ -68,6 +70,14 @@ func Build(d Deps) *gin.Engine {
 		// killed during exactly the incident you need it alive for.
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+
+	// Prometheus scrape target. Unauthenticated, like the probes: the scraper is
+	// an infrastructure component with no user identity, and every practical
+	// alternative ends in a shared secret in a scrape config. It exposes route
+	// names and counts, no order or customer data, and belongs on an internal
+	// listener rather than the public ingress — which is the deployment's job to
+	// enforce, not the router's.
+	r.GET("/metrics", gin.WrapH(metrics.Handler()))
 
 	r.GET("/readyz", func(c *gin.Context) {
 		// Readiness: can this instance actually serve? This one does check

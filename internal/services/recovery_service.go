@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/models"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
 )
 
 // RecoverStuckCharges resumes payments abandoned by a worker that died.
@@ -61,6 +62,11 @@ func (s *PaymentService) RecoverStuckCharges(ctx context.Context, olderThan time
 		}
 		recovered++
 	}
+
+	// Sustained non-zero means worker processes are dying mid-charge (failure
+	// mode E) — a fact no health check reports, because the replacement pod is
+	// perfectly healthy. The rate of this counter is the only external symptom.
+	metrics.JobsReclaimed.WithLabelValues("payment").Add(float64(len(claimed)))
 
 	s.log.InfoContext(ctx, "recovered charges abandoned by a dead worker",
 		"claimed", len(claimed), "recovered", recovered)
@@ -118,6 +124,18 @@ func (s *PaymentService) SweepUnknownPayments(ctx context.Context, limit int) (i
 	if limit <= 0 {
 		limit = 50
 	}
+
+	// Counted separately from the batch below because the batch is capped at
+	// limit: a gauge fed from len(pending) would flatten at 50 and hide exactly
+	// the runaway it exists to catch. This is the "we may have charged them" pile
+	// (failure mode C), and any sustained value is a human's problem.
+	var unknown int64
+	if err := s.store.DB().WithContext(ctx).
+		Raw(`SELECT count(*) FROM payments WHERE status = 'UNKNOWN'`).
+		Scan(&unknown).Error; err != nil {
+		return 0, fmt.Errorf("counting unknown payments: %w", err)
+	}
+	metrics.PaymentsUnknown.Set(float64(unknown))
 
 	var pending []models.Payment
 	err := s.store.DB().WithContext(ctx).Raw(`

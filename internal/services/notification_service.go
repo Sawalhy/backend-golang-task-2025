@@ -11,6 +11,7 @@ import (
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/models"
 	"github.com/Sawalhy/backend-golang-task-2025/internal/repository"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
 )
 
 // Notifier is the port for an actual delivery channel. Real implementations
@@ -167,6 +168,9 @@ func (s *NotificationService) SweepExpiredLeases(ctx context.Context) error {
 		return err
 	}
 	if n > 0 {
+		// The other half of failure mode E: a worker died holding a notification
+		// lease rather than a payment intent.
+		metrics.JobsReclaimed.WithLabelValues("notification").Add(float64(n))
 		s.log.InfoContext(ctx, "reclaimed abandoned notification leases", "count", n)
 	}
 	return nil

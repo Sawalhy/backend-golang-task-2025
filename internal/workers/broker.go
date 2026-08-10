@@ -11,6 +11,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/Sawalhy/backend-golang-task-2025/internal/models"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/tracing"
 )
 
 // Queue names. One queue per JOB THAT MUST HAPPEN; N consumers on a queue are
@@ -27,6 +28,10 @@ const (
 	QueueRefunds  = "refunds"
 
 	ExchangeDLX = "dlx"
+
+	// HeaderTraceparent is the W3C name, used verbatim so any other tracing-aware
+	// consumer of this exchange interoperates without agreeing on a convention.
+	HeaderTraceparent = "traceparent"
 )
 
 // binding describes one queue and the routing keys it subscribes to.
@@ -158,7 +163,16 @@ func (b *Broker) NewPublisher() (*Publisher, error) {
 func (p *Publisher) Close() error { return p.ch.Close() }
 
 // PublishConfirmed publishes one message and blocks until the broker acks it.
+//
+// The traceparent taken from ctx goes on as a header, which is the second half
+// of the handoff: outbox.trace_id carried the trace across the commit, this
+// carries it across the broker to whichever process consumes the message.
 func (p *Publisher) PublishConfirmed(ctx context.Context, routingKey string, eventID string, body []byte) error {
+	headers := amqp.Table{}
+	if tp := tracing.Traceparent(ctx); tp != "" {
+		headers[HeaderTraceparent] = tp
+	}
+
 	dc, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, p.exchange, routingKey,
 		false, false,
 		amqp.Publishing{
@@ -166,6 +180,7 @@ func (p *Publisher) PublishConfirmed(ctx context.Context, routingKey string, eve
 			DeliveryMode: amqp.Persistent, // survive a broker restart
 			MessageId:    eventID,         // the consumer's dedupe key
 			Timestamp:    time.Now().UTC(),
+			Headers:      headers,
 			Body:         body,
 		})
 	if err != nil {

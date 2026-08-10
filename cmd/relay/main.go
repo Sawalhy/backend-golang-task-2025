@@ -21,6 +21,8 @@ import (
 	"github.com/Sawalhy/backend-golang-task-2025/internal/workers"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/database"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/logger"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/tracing"
 )
 
 func main() {
@@ -52,6 +54,25 @@ func run() error {
 		return err
 	}
 	defer func() { _ = database.Close(db) }()
+
+	if sqlDB, err := db.DB(); err == nil {
+		metrics.RegisterDBPool(sqlDB)
+	}
+
+	// The relay continues each event's trace rather than starting its own, using
+	// the traceparent stored on the outbox row.
+	shutdownTracing, err := tracing.Init(ctx, cfg.Observe.ServiceName+"-relay", cfg.Observe.OTLPEndpoint)
+	if err != nil {
+		log.Warn("tracing disabled", "error", err)
+		shutdownTracing = func(context.Context) error { return nil }
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			log.Warn("flushing traces", "error", err)
+		}
+	}()
 
 	store := repository.New(db, cfg.Order.DeadlockRetries)
 
@@ -86,6 +107,10 @@ func run() error {
 	g.Go(func() error {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
+		// Once immediately, so outbox_oldest_unsent_seconds has a value from the
+		// first scrape rather than reading as zero for the first half-minute —
+		// which is indistinguishable from a healthy empty outbox.
+		workers.ReportOutboxLag(gctx, store, log)
 		for {
 			select {
 			case <-gctx.Done():
@@ -95,6 +120,10 @@ func run() error {
 			}
 		}
 	})
+
+	// Same reasoning as the worker: no HTTP server, but the mode B alarm
+	// (outbox_oldest_unsent_seconds) is produced here and nowhere else.
+	g.Go(func() error { return metrics.Serve(gctx, cfg.Observe.MetricsAddr, log) })
 
 	if err := g.Wait(); err != nil {
 		return fmt.Errorf("relay: %w", err)

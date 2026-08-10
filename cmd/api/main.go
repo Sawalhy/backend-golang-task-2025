@@ -26,6 +26,8 @@ import (
 	"github.com/Sawalhy/backend-golang-task-2025/internal/workers"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/database"
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/logger"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/tracing"
 )
 
 //	@title			Concurrent Order Processing API
@@ -98,6 +100,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Tracing first, so spans exist for everything that follows. A missing
+	// collector must not stop the API booting — observability is not a
+	// dependency of serving traffic — so a failure here is logged and dropped.
+	shutdownTracing, err := tracing.Init(ctx, cfg.Observe.ServiceName+"-api", cfg.Observe.OTLPEndpoint)
+	if err != nil {
+		log.Warn("tracing disabled", "error", err)
+		shutdownTracing = func(context.Context) error { return nil }
+	}
+	defer func() {
+		// Its own context: ctx is already cancelled by the time this runs, and the
+		// batch processor needs a live one to flush the last spans.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			log.Warn("flushing traces", "error", err)
+		}
+	}()
+
 	db, err := database.Open(ctx, database.Options{
 		DSN:             cfg.DB.DSN,
 		MaxOpenConns:    cfg.DB.MaxOpenConns,
@@ -109,6 +129,12 @@ func run() error {
 		return err
 	}
 	defer func() { _ = database.Close(db) }()
+
+	// Pool saturation is failure mode J and the first thing to go under a burst.
+	// Read at scrape time, so there is no sampling goroutine to leak.
+	if sqlDB, err := db.DB(); err == nil {
+		metrics.RegisterDBPool(sqlDB)
+	}
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.Redis.Addr,

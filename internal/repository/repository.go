@@ -21,6 +21,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/Sawalhy/backend-golang-task-2025/pkg/database"
+	"github.com/Sawalhy/backend-golang-task-2025/pkg/metrics"
 )
 
 // Store is the handle every repository hangs off. It carries the pool and the
@@ -81,6 +82,11 @@ func (s *Store) InTx(ctx context.Context, fn TxFunc) error {
 		if !database.IsRetryable(err) {
 			return err
 		}
+		// Counted, not just retried. Deadlocks are supposed to be impossible here
+		// — line items are sorted on product_id before inventory is touched — so a
+		// rising rate is the signal that some write path bypassed the sort
+		// (failure mode G), which is invisible from the outside otherwise.
+		metrics.DeadlockRetries.Inc()
 		lastErr = err
 	}
 

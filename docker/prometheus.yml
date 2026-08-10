@@ -1,0 +1,38 @@
+# Prometheus scrape configuration.
+#
+# Pull, not push: the app exposes /metrics as plain text and Prometheus collects
+# it on an interval. No agent, no SDK-side batching, and a scrape that fails is
+# itself a signal (up == 0) rather than silence.
+#
+# The three entry points are scraped separately because they measure different
+# things. Almost every failure-mode metric in DESIGN_NOTES §5.19 is produced by
+# the worker or the relay, not the api — an api-only scrape would show a
+# perfectly healthy system while the pipeline behind it was wedged.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["api:8080"]
+        labels: { component: api }
+
+  # Worker and relay are not HTTP services; each runs a metrics-only listener.
+  - job_name: worker
+    static_configs:
+      - targets: ["worker:9100"]
+        labels: { component: worker }
+
+  - job_name: relay
+    static_configs:
+      - targets: ["relay:9100"]
+        labels: { component: relay }
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
