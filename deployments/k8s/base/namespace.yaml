@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: order-processing
+  labels:
+    # Enforced by the built-in Pod Security admission controller. `restricted` is
+    # the strictest profile: no privilege escalation, no running as root, all
+    # capabilities dropped, seccomp on. Every workload here already satisfies it,
+    # so labelling the namespace turns those pod-level settings from a convention
+    # into something the API server rejects violations of.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

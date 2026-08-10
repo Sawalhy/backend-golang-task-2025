@@ -1,0 +1,96 @@
+# The outbox relay: claims unsent rows with FOR UPDATE SKIP LOCKED, publishes
+# them, and marks sent_at only after the broker confirms.
+#
+# Two replicas, and the second one is free. SKIP LOCKED means two relays never
+# claim the same row, so the only thing a second instance changes is that a node
+# drain does not stop the pipeline (cmd/relay/main.go:5).
+#
+# Its pool is not configurable and does not need to be: cmd/relay/main.go:47
+# hardcodes 4 open / 2 idle, because it runs one claiming transaction at a time
+# and every connection it holds is one the API cannot use. DB_MAX_OPEN_CONNS from
+# the ConfigMap is deliberately ignored by that process.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+  labels:
+    app.kubernetes.io/name: relay
+    app.kubernetes.io/component: relay
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: relay
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: relay
+        app.kubernetes.io/component: relay
+    spec:
+      # Shorter than the worker's because the unit of work is shorter: one batch
+      # of publishes and their confirms, not a payment. Anything unconfirmed when
+      # the process exits still has sent_at IS NULL, so the next relay claims
+      # exactly the same batch — the outbox is what makes a hard stop survivable.
+      terminationGracePeriodSeconds: 20
+
+      automountServiceAccountToken: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        - name: wait-for-schema
+          image: order-processing:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/migrate", "version"]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: relay
+          image: order-processing:0.1.0
+          command: ["/app/relay"]
+          imagePullPolicy: IfNotPresent
+
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

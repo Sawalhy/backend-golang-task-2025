@@ -1,0 +1,59 @@
+# Default-deny ingress for the namespace, then one hole for the one thing that
+# actually serves traffic.
+#
+# The point is the worker and the relay. Neither listens on anything, so nothing
+# should be able to open a connection to them — and with these policies in place,
+# nothing can. A compromised pod elsewhere in the cluster cannot reach them at
+# all, rather than being stopped only by the fact that they happen not to have a
+# port open today.
+#
+# --- Two deliberate limits --------------------------------------------------
+#
+# Ingress only, no egress rules. A default-deny *egress* policy is the classic
+# way to break a cluster: it blocks DNS, every service name stops resolving, and
+# the failure looks like the database being down rather than like a policy.
+# Doing it properly means an explicit allow to kube-dns in kube-system, plus one
+# per external dependency — worth it in production, but it is a per-cluster
+# decision (which CNI, which DNS service labels) and a wrong guess here would
+# ship a manifest that takes the system down on apply.
+#
+# Enforcement is the CNI's, not the API server's. kind's default CNI (kindnet)
+# accepts NetworkPolicy objects and ignores them, so on a kind cluster these
+# apply cleanly and enforce nothing. Calico, Cilium and every managed cloud CNI
+# enforce them. `kind create cluster --config kind-cluster.yaml` disables the
+# default CNI if you want to install Calico and see them bite.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  # Empty selector: every pod in the namespace.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  policyTypes:
+    - Ingress
+  ingress:
+    # No `from`, so any source — this is the public API, and what is allowed to
+    # reach it is the Ingress controller's or the mesh's decision, made in a
+    # different namespace. Restricting it to a namespaceSelector here would bake
+    # in an assumption about where that controller runs.
+    #
+    # Leaving the source open also keeps kubelet liveness and readiness probes
+    # working. Those originate from the node, not from a pod, and a policy
+    # written only in terms of podSelectors would deny them on a strict CNI —
+    # producing pods that fail their probes for reasons no application log will
+    # ever explain.
+    - ports:
+        - protocol: TCP
+          port: 8080

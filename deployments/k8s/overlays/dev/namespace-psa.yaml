@@ -1,0 +1,22 @@
+# Relax Pod Security admission from `restricted` to `baseline` for this overlay
+# only.
+#
+# The application pods satisfy `restricted` and keep doing so — non-root, no
+# privilege escalation, all capabilities dropped, read-only root filesystem,
+# RuntimeDefault seccomp. What does not satisfy it is the three stock datastore
+# images this overlay adds: postgres, rabbitmq and redis all start as root and
+# drop privileges in their own entrypoints, which `restricted` rejects before
+# they get the chance.
+#
+# Making them comply is possible — a pinned runAsUser per image, an fsGroup so
+# the mounted volume is writable by it — but they are a laptop convenience that a
+# real deployment replaces with managed services, so hardening them would be
+# effort spent on the one part of this overlay that never ships. base keeps
+# `restricted`, which is what a real cluster gets.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: order-processing
+  labels:
+    pod-security.kubernetes.io/enforce: baseline

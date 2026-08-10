@@ -1,0 +1,86 @@
+# Demo data: products, inventory and two known accounts.
+#
+# Development only, and that is the entire reason this Job is in an overlay
+# rather than next to the migration it depends on. It creates
+# admin@example.com / admin12345 with the ADMIN role. In a real environment that
+# is not a fixture, it is a published administrator credential.
+#
+# Ordering after the migration comes from the init container, not from anything
+# Kubernetes guarantees: two Jobs applied together start together, and `seed`
+# would otherwise insert into tables that do not exist yet.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed
+  labels:
+    app.kubernetes.io/name: seed
+    app.kubernetes.io/component: fixtures
+spec:
+  backoffLimit: 12
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seed
+        app.kubernetes.io/component: fixtures
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-schema
+          image: order-processing:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/migrate", "version"]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: seed
+          image: order-processing:0.1.0
+          imagePullPolicy: IfNotPresent
+          # Idempotent: existing rows are skipped rather than duplicated, so a
+          # retry after a partial run is safe.
+          command: ["/app/seed"]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          env:
+            # 12 is deliberately slow — that is the point of bcrypt — and the
+            # seed hashes several passwords in a row. 10 keeps the Job to a few
+            # seconds without weakening anything that matters, because none of
+            # these accounts should exist outside a demo anyway.
+            - name: BCRYPT_COST
+              value: "10"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
